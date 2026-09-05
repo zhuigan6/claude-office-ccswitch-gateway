@@ -137,20 +137,27 @@ class TestEndToEnd(unittest.TestCase):
         cls.proc = subprocess.Popen(
             [sys.executable, "-u", GATEWAY],
             cwd=REPO, env=env,
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=open(os.path.join(cls.data_dir, "gateway-stderr.log"), "wb"),
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
+        # 必须绕过一切代理（macOS 的 urllib 会读系统代理 _scproxy，CI 机器上可能存在）
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         deadline = time.time() + 20
         while time.time() < deadline:
             try:
-                with urllib.request.urlopen(
-                        f"http://127.0.0.1:{cls.gateway_port}/healthz", timeout=2) as r:
+                with opener.open(f"http://127.0.0.1:{cls.gateway_port}/healthz", timeout=2) as r:
                     if r.status == 200:
                         break
             except Exception:
                 time.sleep(0.3)
         else:
-            raise RuntimeError("gateway did not become healthy for e2e tests")
+            log_path = os.path.join(cls.data_dir, "gateway-stderr.log")
+            tail = ""
+            if os.path.exists(log_path):
+                with open(log_path, "r", encoding="utf-8", errors="replace") as fh:
+                    tail = fh.read()[-800:]
+            raise RuntimeError(f"gateway did not become healthy for e2e tests\n[gateway stderr tail]\n{tail}")
 
     @classmethod
     def tearDownClass(cls):
