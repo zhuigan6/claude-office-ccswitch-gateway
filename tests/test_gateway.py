@@ -266,5 +266,69 @@ class TestCCSwitchState(unittest.TestCase):
             office_edge.read_ccswitch_state(force=True)  # 还原缓存
 
 
+class TestExperienceFidelity(unittest.TestCase):
+    """v3.2 体验对齐：指纹记忆清洗 + 错误形状归一 + 附件默认 TTL。"""
+
+    def test_sanitize_memory_record_and_apply(self):
+        original = {"model": "m", "metadata": {"user_id": "u"}, "stream": True,
+                    "messages": [{"role": "user", "content": [
+                        {"type": "thinking", "thinking": "t"},
+                        {"type": "text", "text": "hi", "cache_control": {"type": "ephemeral"}}]}]}
+        sanitized = office_edge.deep_sanitize(json.loads(json.dumps(original)))
+        office_edge._record_sanitize_memory("prov-A", original, sanitized)
+        try:
+            entry = office_edge._SANITIZE_MEMORY["prov-A"]
+            self.assertIn("metadata", entry["top_removed"])
+            self.assertTrue(entry["extras"])
+            fresh = json.loads(json.dumps(original))
+            stripped = office_edge._apply_sanitize_memory(fresh, entry)
+            self.assertNotIn("metadata", stripped)
+            self.assertEqual(stripped["messages"][0]["content"],
+                             [{"type": "text", "text": "hi"}])
+        finally:
+            office_edge._SANITIZE_MEMORY.pop("prov-A", None)
+
+    def test_sanitize_memory_only_strips_learned_fields(self):
+        # 只记住了 metadata 被拒时，其他字段（如 temperature）必须保留
+        original = {"model": "m", "metadata": {"u": 1}, "temperature": 0.5,
+                    "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}]}
+        sanitized = office_edge.deep_sanitize(json.loads(json.dumps(original)))
+        office_edge._record_sanitize_memory("prov-B", original, sanitized)
+        try:
+            entry = office_edge._SANITIZE_MEMORY["prov-B"]
+            self.assertNotIn("temperature", entry["top_removed"])
+            fresh = office_edge._apply_sanitize_memory({"model": "m", "metadata": {"u": 1},
+                                                        "temperature": 0.7,
+                                                        "messages": [{"role": "user", "content": "x"}]}, entry)
+            self.assertEqual(fresh["temperature"], 0.7)
+            self.assertNotIn("metadata", fresh)
+        finally:
+            office_edge._SANITIZE_MEMORY.pop("prov-B", None)
+
+    def test_ensure_anthropic_error_passthrough_when_shaped(self):
+        raw = json.dumps({"type": "error", "error": {"type": "rate_limit_error", "message": "slow down"}}).encode()
+        self.assertEqual(office_edge._ensure_anthropic_error(429, raw), raw)
+
+    def test_ensure_anthropic_error_wraps_plain_message(self):
+        raw = json.dumps({"message": "model not found"}).encode()
+        out = json.loads(office_edge._ensure_anthropic_error(404, raw))
+        self.assertEqual(out["type"], "error")
+        self.assertEqual(out["error"]["type"], "api_error")
+        self.assertEqual(out["error"]["message"], "model not found")
+
+    def test_ensure_anthropic_error_wraps_non_json(self):
+        out = json.loads(office_edge._ensure_anthropic_error(502, b"<html>bad gateway</html>"))
+        self.assertEqual(out["type"], "error")
+        self.assertIn("bad gateway", out["error"]["message"])
+
+    def test_files_default_ttl_24h(self):
+        meta = office_edge.files_create("ttl.txt", "text/plain", b"x", "user_message", None)
+        try:
+            span = meta["expires_at"] - meta["created_at"]
+            self.assertEqual(span, 86400)
+        finally:
+            office_edge.files_delete(meta["id"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

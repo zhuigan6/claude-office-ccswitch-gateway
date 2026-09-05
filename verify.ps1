@@ -20,7 +20,7 @@ if (-not $BaseUrl) {
 }
 
 $python = $null
-foreach ($candidate in @((Join-Path $root "_python\python.exe"), (Join-Path $root ".venv\Scripts\python.exe"), (Get-Command "py" -ErrorAction SilentlyContinue).Source, (Get-Command "python" -ErrorAction SilentlyContinue).Source)) {
+foreach ($candidate in @((Join-Path $root "_python\python.exe"), (Get-Command "py" -ErrorAction SilentlyContinue).Source, (Get-Command "python" -ErrorAction SilentlyContinue).Source)) {
     if ($candidate -and (Test-Path -LiteralPath $candidate)) { $python = $candidate; break }
 }
 if (-not $python) { throw "未找到 Python。" }

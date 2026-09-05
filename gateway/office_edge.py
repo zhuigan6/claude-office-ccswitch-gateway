@@ -93,7 +93,7 @@ MAX_FILE_BYTES = int(os.getenv("EDGE_MAX_FILE_BYTES", str(32 * 1024 * 1024)))
 MAX_EXTRACT_CHARS = int(os.getenv("EDGE_MAX_EXTRACT_CHARS", "60000"))
 ACCESS_LOG = os.path.join(DATA_DIR, "edge-access.log")
 ACCESS_LOG_MAX = int(os.getenv("EDGE_ACCESS_LOG_MAX", str(2 * 1024 * 1024)))
-VERSION = "3.1"
+VERSION = "3.2"
 
 # 到 127.0.0.1 的转发绝不走系统代理（http.client 本身不读环境代理，这里再兜底，防止 502 no body）
 for _k in ("NO_PROXY", "no_proxy"):
@@ -379,6 +379,82 @@ def deep_sanitize(p: dict) -> dict:
     return p
 
 
+# --------------------------------------------------------------------------- #
+# 供应商指纹记忆：某供应商拒绝过某些字段并经深清洗重试成功后，记住差异；
+# 后续请求直接预应用同样的清洗，省掉一次注定失败的往返（ADR-0008）。
+# 记忆按“当前供应商 id”为键，切换供应商自动失效；透明转发仍是默认行为。
+# --------------------------------------------------------------------------- #
+_SANITIZE_MEMORY: dict = {}
+_CORE_FIELDS = {"model", "messages", "max_tokens", "stream"}
+
+
+def _payload_has_extras(p: dict) -> bool:
+    """报文里是否带“深清洗会去除”的内容块/系统形态。"""
+    if not isinstance(p, dict):
+        return False
+    if isinstance(p.get("system"), list):
+        return True
+    for m in (p.get("messages") or []):
+        if isinstance(m, dict) and isinstance(m.get("content"), list):
+            for b in m["content"]:
+                if isinstance(b, dict) and (
+                        b.get("type") in ("thinking", "redacted_thinking")
+                        or "cache_control" in b or "citations" in b):
+                    return True
+    return False
+
+
+def _record_sanitize_memory(provider_id, original: dict, sanitized: dict) -> None:
+    if not provider_id:
+        return
+    top_removed = tuple(sorted(k for k in original if k not in sanitized and k not in _CORE_FIELDS))
+    _SANITIZE_MEMORY[provider_id] = {"top_removed": top_removed, "extras": _payload_has_extras(original)}
+
+
+def _apply_sanitize_memory(payload: dict, entry: dict) -> dict:
+    p = dict(payload)
+    for k in entry.get("top_removed") or ():
+        p.pop(k, None)
+    if entry.get("extras"):
+        for m in (p.get("messages") or []):
+            if isinstance(m, dict) and isinstance(m.get("content"), list):
+                m["content"] = [x for x in (_strip_block(b) for b in m["content"]) if x is not None]
+        sy = p.get("system")
+        if isinstance(sy, list):
+            parts = [b.get("text", "") if isinstance(b, dict) else str(b) for b in sy]
+            sy = "\n\n".join(x for x in parts if x)
+            if sy:
+                p["system"] = sy
+            else:
+                p.pop("system", None)
+    return p
+
+
+def _ensure_anthropic_error(status: int, data: bytes) -> bytes:
+    """把上游错误体归一为 Anthropic 错误形状（保留原状态码与原信息），
+    让加载项按官方错误结构展示，而不是出现无名的 Something went wrong。"""
+    obj = None
+    try:
+        obj = json.loads(data.decode("utf-8", "ignore"))
+    except Exception:
+        obj = None
+    if isinstance(obj, dict):
+        err = obj.get("error")
+        if isinstance(err, dict) and err.get("type"):
+            return data  # 已是 Anthropic 形状，原样透传
+        if isinstance(err, dict):
+            message = str(err.get("message") or err)[:800]
+        elif isinstance(obj.get("message"), str):
+            message = obj["message"][:800]
+        else:
+            message = json.dumps(obj, ensure_ascii=False)[:800]
+    else:
+        message = data.decode("utf-8", "ignore")[:800]
+    return json.dumps({"type": "error",
+                       "error": {"type": "api_error", "message": message or f"upstream HTTP {status}"}},
+                      ensure_ascii=False).encode("utf-8")
+
+
 def _shape_summary(payload: dict) -> str:
     """请求形状摘要（不含正文，不泄漏内容）：模型/流式/角色序列/块类型计数。"""
     msgs = payload.get("messages") if isinstance(payload.get("messages"), list) else []
@@ -464,7 +540,7 @@ def files_create(filename, content_type, data: bytes, purpose, expires_in_second
         fh.write(data)
     os.replace(tmp, dst)  # 原子替换
     now = int(time.time())
-    ttl = expires_in_seconds if isinstance(expires_in_seconds, int) and 0 < expires_in_seconds <= 86400 else 3600
+    ttl = expires_in_seconds if isinstance(expires_in_seconds, int) and 0 < expires_in_seconds <= 86400 else 86400  # 默认 24h：长会话中稍后引用的附件不再轻易过期
     digest = hashlib.sha256(data).hexdigest()
     with files_conn() as con:
         con.execute("INSERT INTO files VALUES (?,?,?,?,?,?,?,?)",
@@ -804,7 +880,7 @@ def _checked_sse_line(line: bytes) -> bytes:
     return line + b"\n"
 
 
-def upstream_roundtrip(handler, upstream_path, payload, stream, sanitized=False):
+def upstream_roundtrip(handler, upstream_path, payload, stream, sanitized=False, provider_id=None, original_payload=None):
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     host, port, _ = _split_base(CCSWITCH_BASE)
     conn = HTTPConnection(host, port, timeout=600 if stream else 300)
@@ -818,14 +894,20 @@ def upstream_roundtrip(handler, upstream_path, payload, stream, sanitized=False)
             if (not sanitized) and _RETRYABLE_4XX.search(text):
                 _log("upstream 4xx -> deep-sanitize retry:", text[:160].replace("\n", " "))
                 retry = deep_sanitize(json.loads(json.dumps(payload)))  # 深拷贝
-                return upstream_roundtrip(handler, upstream_path, retry, stream, sanitized=True)
+                result = upstream_roundtrip(handler, upstream_path, retry, stream,
+                                            sanitized=True, provider_id=provider_id)
+                if provider_id and getattr(handler, "_last_status", 500) < 400:
+                    # 重试成功：记住该供应商的差异，后续请求预清洗（ADR-0008）
+                    _record_sanitize_memory(provider_id, original_payload or payload, retry)
+                return result
             try:
                 with open(os.path.join(DATA_DIR, "last-upstream-error.txt"), "wb") as fh:
                     fh.write(("HTTP %s\n" % resp.status).encode() + err)
             except Exception:
                 pass
             ct = "application/json"
-            return handler.proxy_response(resp.status, err, [("Content-Type", ct)])
+            return handler.proxy_response(resp.status, _ensure_anthropic_error(resp.status, err),
+                                          [("Content-Type", ct)])
         if stream:
             handler.begin_sse(resp.status)
             # 逐行校验 data: 载荷后再转发：畸形事件替换为明确的 gateway_bad_event，
@@ -867,7 +949,8 @@ def openai_stream_from_anthropic(handler, upstream_path, payload, req_model):
     resp = conn.getresponse()
     if resp.status >= 400:
         err = resp.read(); conn.close()
-        return handler.proxy_response(resp.status, err, [("Content-Type", "application/json")])
+        return handler.proxy_response(resp.status, _ensure_anthropic_error(resp.status, err),
+                                      [("Content-Type", "application/json")])
     handler.begin_sse(200, openai_mode=True)
     cid = "chatcmpl-" + str(int(time.time())); created = int(time.time())
 
@@ -965,6 +1048,7 @@ class EdgeHandler(BaseHTTPRequestHandler):
         return self._presented_token(query) in want
 
     def proxy_response(self, status, data, headers, conn=None):
+        self._last_status = status
         self.send_response(status)
         has_ct = False
         for k, v in headers:
@@ -982,6 +1066,7 @@ class EdgeHandler(BaseHTTPRequestHandler):
             conn.close()
 
     def begin_sse(self, status, openai_mode=False):
+        self._last_status = status
         self.send_response(status)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-cache")
@@ -1126,6 +1211,7 @@ class EdgeHandler(BaseHTTPRequestHandler):
         # Anthropic Messages
         messages_paths = {"/v1/messages", "/messages", upstream_prefix() + "/v1/messages"}
         if path in messages_paths:
+            provider_id = (state.get("active") or {}).get("id")
             try:
                 payload = normalize_payload(payload)
                 payload = expand_file_refs(payload)
@@ -1133,8 +1219,16 @@ class EdgeHandler(BaseHTTPRequestHandler):
                 return self._json(e.code, {"error": {"type": "invalid_request_error", "message": e.message}})
             if LOG_SHAPE:
                 _log("request shape:", _shape_summary(payload))
-            _log(f"POST /v1/messages provider={provider} model={payload.get('model')} stream={payload.get('stream')}")
-            return upstream_roundtrip(self, upstream_prefix() + "/v1/messages", payload, bool(payload.get("stream")))
+            original_payload = payload  # 记忆预清洗前的透明报文，用于差异记忆
+            # 供应商指纹记忆：已学会该供应商拒绝某些字段时，直接预清洗（ADR-0008）
+            memo = _SANITIZE_MEMORY.get(provider_id)
+            if memo:
+                payload = _apply_sanitize_memory(payload, memo)
+            _log(f"POST /v1/messages provider={provider} model={payload.get('model')} stream={payload.get('stream')}"
+                 + (" [pre-sanitized]" if memo else ""))
+            return upstream_roundtrip(self, upstream_prefix() + "/v1/messages", payload,
+                                      bool(payload.get("stream")), provider_id=provider_id,
+                                      original_payload=original_payload)
 
         # OpenAI Chat
         if path in ("/v1/chat/completions", "/chat/completions"):
@@ -1192,7 +1286,8 @@ class EdgeHandler(BaseHTTPRequestHandler):
         conn.request("POST", upstream_prefix() + "/v1/messages", body=body, headers=_upstream_headers(self))
         resp = conn.getresponse(); data = resp.read(); conn.close()
         if resp.status >= 400:
-            return self.proxy_response(resp.status, data, [("Content-Type", "application/json")])
+            return self.proxy_response(resp.status, _ensure_anthropic_error(resp.status, data),
+                                       [("Content-Type", "application/json")])
         try:
             self._json(200, anthropic_to_openai(json.loads(data.decode("utf-8")), req_model))
         except Exception:

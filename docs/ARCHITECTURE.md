@@ -50,7 +50,7 @@ Office 会过滤不含 `claude` 的模型 ID。网关把当前供应商的槽位
 ## 6. Files API 与安全
 
 - 元数据 SQLite（含 SHA-256），内容以随机 `file_<hex>` 落盘（禁止文件名拼路径、防穿越），临时文件 + `os.replace` 原子写
-- 过期自动清理（默认 1h TTL）；归档 415 拒绝；未知二进制 415 明确报错不静默丢；sqlite 连接保证关闭（防句柄泄漏）
+- 过期自动清理（默认 24h TTL，上限 24h）；归档 415 拒绝；未知二进制 415 明确报错不静默丢；sqlite 连接保证关闭（防句柄泄漏）
 - 文本提取：标准库兜底（zipfile+xml、PDF zlib best-effort）；装了 pypdf/python-docx/openpyxl/python-pptx 自动增强
 
 ## 7. 进程模型与自愈

@@ -13,7 +13,7 @@
 零依赖：装好 Python 3.9+ 即可。
 
 ```powershell
-python -m unittest discover -s tests -v   # 回归测试（21 项，必须全绿）
+python -m unittest discover -s tests -v   # 回归测试（单元 + 端到端，必须全绿）
 powershell -ExecutionPolicy Bypass -File .\verify.ps1   # 实机验收门（需网关在跑）
 ```
 

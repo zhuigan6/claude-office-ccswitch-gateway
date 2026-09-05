@@ -38,9 +38,30 @@ jobs:
           "$($h.ToLower())  $($f.Name)" | Out-File -Encoding ascii dist\SHA256SUMS.txt
           Get-Content dist\SHA256SUMS.txt
 
+      - name: Extract CHANGELOG section
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $ver = $env:GITHUB_REF_NAME.TrimStart("v")
+          $lines = Get-Content CHANGELOG.md
+          $startIdx = $null
+          for ($i = 0; $i -lt $lines.Count; $i++) {
+            if ($lines[$i] -match ("^## \[" + [regex]::Escape($ver) + "\]")) { $startIdx = $i; break }
+          }
+          if ($null -eq $startIdx) {
+            $body = @("Release $env:GITHUB_REF_NAME", "", "（CHANGELOG 中未找到 $ver 小节，请查看完整 CHANGELOG.md）")
+          } else {
+            $body = @($lines[$startIdx..($lines.Count - 1)])
+            for ($i = 1; $i -lt $body.Count; $i++) {
+              if ($body[$i] -match "^## \[") { $body = @($body[0..($i - 2)]); break }
+            }
+          }
+          $body -join "`r`n" | Out-File -Encoding utf8 dist\release-notes.md
+          Get-Content dist\release-notes.md
+
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
         shell: pwsh
         run: |
-          gh release create "$env:GITHUB_REF_NAME" dist\*.zip dist\SHA256SUMS.txt --generate-notes --title "$env:GITHUB_REF_NAME"
+          gh release create "$env:GITHUB_REF_NAME" dist\*.zip dist\SHA256SUMS.txt --notes-file dist\release-notes.md --title "$env:GITHUB_REF_NAME"

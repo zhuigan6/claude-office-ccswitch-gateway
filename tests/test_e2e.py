@@ -276,5 +276,20 @@ class TestEndToEnd(unittest.TestCase):
         self.assertIn("HELLO-FILE-CONTENT-FROM-E2E", sent)  # file_id 已内联为文本
 
 
+    def test_05_sanitize_memory_halves_roundtrips(self):
+        # 依赖 test_02 已让 mock 上游"学会"metadata 被拒（ADR-0008）：
+        # 第二次带 metadata 的请求应被预清洗，一次命中上游而非两次
+        MockCCSwitch.request_count = 0
+        payload = {"model": "claude-sonnet-5", "max_tokens": 16,
+                   "metadata": {"user_id": "u2"},
+                   "messages": [{"role": "user", "content": "hello again"}]}
+        status, body = self._req("POST", "/v1/messages", headers=self._auth(),
+                                 body=json.dumps(payload).encode())
+        self.assertEqual(status, 200, body[:300])
+        self.assertEqual(MockCCSwitch.request_count, 1,
+                         "expected pre-sanitized single roundtrip after memory learned")
+        self.assertNotIn("metadata", MockCCSwitch.last_payload)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
