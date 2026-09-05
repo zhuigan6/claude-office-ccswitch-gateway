@@ -134,11 +134,11 @@ class TestEndToEnd(unittest.TestCase):
             "EDGE_TOKEN": "tok-e2e",
             "EDGE_LOG_REDACT": "1",
         })
+        cls._gateway_log = open(os.path.join(cls.data_dir, "gateway-log.txt"), "wb")
         cls.proc = subprocess.Popen(
             [sys.executable, "-u", GATEWAY],
             cwd=REPO, env=env,
-            stdout=subprocess.DEVNULL,
-            stderr=open(os.path.join(cls.data_dir, "gateway-stderr.log"), "wb"),
+            stdout=cls._gateway_log, stderr=cls._gateway_log,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         # 必须绕过一切代理（macOS 的 urllib 会读系统代理 _scproxy，CI 机器上可能存在）
@@ -152,12 +152,23 @@ class TestEndToEnd(unittest.TestCase):
             except Exception:
                 time.sleep(0.3)
         else:
-            log_path = os.path.join(cls.data_dir, "gateway-stderr.log")
-            tail = ""
-            if os.path.exists(log_path):
-                with open(log_path, "r", encoding="utf-8", errors="replace") as fh:
-                    tail = fh.read()[-800:]
-            raise RuntimeError(f"gateway did not become healthy for e2e tests\n[gateway stderr tail]\n{tail}")
+            import socket as _s
+            try:
+                raw = _s.create_connection(("127.0.0.1", cls.gateway_port), timeout=2)
+                raw.close()
+                raw_note = "raw tcp connect OK (HTTP layer problem)"
+            except OSError as exc:
+                raw_note = f"raw tcp connect FAILED: {exc}"
+            try:
+                cls._gateway_log.flush()
+                with open(os.path.join(cls.data_dir, "gateway-log.txt"), "r",
+                          encoding="utf-8", errors="replace") as fh:
+                    tail = fh.read()[-1200:]
+            except OSError:
+                tail = "(log unreadable)"
+            raise RuntimeError(
+                f"gateway did not become healthy: proc.poll()={cls.proc.poll()!r} "
+                f"port={cls.gateway_port}\n[{raw_note}]\n[gateway log tail]\n{tail or '(empty log)'}")
 
     @classmethod
     def tearDownClass(cls):
