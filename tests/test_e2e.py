@@ -26,8 +26,11 @@ GATEWAY = os.path.join(REPO, "gateway", "office_edge.py")
 
 
 def free_port() -> int:
+    """与网关一致的探测方式：SO_REUSEADDR + bind(0) + listen 后关闭，取可用端口。"""
     s = socket.socket()
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     s.bind(("127.0.0.1", 0))
+    s.listen(1)
     port = s.getsockname()[1]
     s.close()
     return port
@@ -121,12 +124,10 @@ class TestEndToEnd(unittest.TestCase):
         cls.mock_thread = threading.Thread(target=cls.mock.serve_forever, daemon=True)
         cls.mock_thread.start()
 
-        # 3) 网关子进程
-        cls.gateway_port = free_port()
-        env = os.environ.copy()
-        env.update({
+        # 3) 网关子进程：多端口重试（应对 CI 上偶发的 bind 卡死/端口竞争）
+        base_env = os.environ.copy()
+        base_env.update({
             "EDGE_HOST": "127.0.0.1",
-            "EDGE_PORT": str(cls.gateway_port),
             "EDGE_DATA_DIR": os.path.join(cls.data_dir, "runtime"),
             "CCSWITCH_DB": cls.db_path,
             "CCSWITCH_BASE": f"http://127.0.0.1:{cls.mock_port}",
@@ -134,41 +135,48 @@ class TestEndToEnd(unittest.TestCase):
             "EDGE_TOKEN": "tok-e2e",
             "EDGE_LOG_REDACT": "1",
         })
-        cls._gateway_log = open(os.path.join(cls.data_dir, "gateway-log.txt"), "wb")
-        cls.proc = subprocess.Popen(
-            [sys.executable, "-u", GATEWAY],
-            cwd=REPO, env=env,
-            stdout=cls._gateway_log, stderr=cls._gateway_log,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
-        # 必须绕过一切代理（macOS 的 urllib 会读系统代理 _scproxy，CI 机器上可能存在）
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-        deadline = time.time() + 20
-        while time.time() < deadline:
+        cls._gateway_log = open(os.path.join(cls.data_dir, "gateway-log.txt"), "ab")
+        last_err = None
+        for attempt in range(3):
+            cls.gateway_port = free_port()
+            env = dict(base_env, EDGE_PORT=str(cls.gateway_port))
+            cls.proc = subprocess.Popen(
+                [sys.executable, "-u", GATEWAY],
+                cwd=REPO, env=env,
+                stdout=cls._gateway_log, stderr=cls._gateway_log,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            deadline = time.time() + 10
+            healthy = False
+            while time.time() < deadline:
+                try:
+                    with opener.open(f"http://127.0.0.1:{cls.gateway_port}/healthz", timeout=2) as r:
+                        if r.status == 200:
+                            healthy = True
+                            break
+                except Exception:
+                    time.sleep(0.3)
+            if healthy:
+                last_err = None
+                break
+            last_err = f"attempt {attempt + 1}: poll={cls.proc.poll()!r} port={cls.gateway_port}"
             try:
-                with opener.open(f"http://127.0.0.1:{cls.gateway_port}/healthz", timeout=2) as r:
-                    if r.status == 200:
-                        break
+                cls.proc.kill()
+                cls.proc.wait(timeout=5)
             except Exception:
-                time.sleep(0.3)
-        else:
-            import socket as _s
-            try:
-                raw = _s.create_connection(("127.0.0.1", cls.gateway_port), timeout=2)
-                raw.close()
-                raw_note = "raw tcp connect OK (HTTP layer problem)"
-            except OSError as exc:
-                raw_note = f"raw tcp connect FAILED: {exc}"
+                pass
+            time.sleep(1)
+        if last_err is not None:
             try:
                 cls._gateway_log.flush()
                 with open(os.path.join(cls.data_dir, "gateway-log.txt"), "r",
                           encoding="utf-8", errors="replace") as fh:
-                    tail = fh.read()[-1200:]
+                    tail = fh.read()[-1500:]
             except OSError:
                 tail = "(log unreadable)"
             raise RuntimeError(
-                f"gateway did not become healthy: proc.poll()={cls.proc.poll()!r} "
-                f"port={cls.gateway_port}\n[{raw_note}]\n[gateway log tail]\n{tail or '(empty log)'}")
+                f"gateway did not become healthy ({last_err})\n[gateway log tail]\n{tail or '(empty log)'}")
 
     @classmethod
     def tearDownClass(cls):
@@ -178,6 +186,11 @@ class TestEndToEnd(unittest.TestCase):
                 cls.proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 cls.proc.kill()
+        if cls._gateway_log:
+            try:
+                cls._gateway_log.close()
+            except OSError:
+                pass
         if cls.mock:
             cls.mock.shutdown()
             cls.mock.server_close()
