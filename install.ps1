@@ -22,10 +22,14 @@ if ($root -match "(?i)\\OneDrive\\|\\AppData\\Local\\Temp\\|\\Downloads\\") {
     throw "请把本仓库放到固定目录（不要放 OneDrive/临时/下载目录）后再安装。当前路径：$root"
 }
 
-# 2) 旧版/残留迁移：按"先守护后网关"顺序停旧进程（避免守护重拉网关），移除旧自启键
+# 2) 旧版/残留迁移：仅清理属于本目录（或已知旧版路径）的进程，按"先守护后网关"顺序；
+#    多副本安装互不影响——别的目录里的网关不受本安装影响
 foreach ($pattern in @('supervisor\.py|Supervisor\.ps1', 'office_edge\.py')) {
     $oldProcs = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
-        Where-Object { $_.CommandLine -match $pattern }
+        Where-Object {
+            $_.CommandLine -and $_.CommandLine -match $pattern -and
+            ($_.CommandLine -like "*$root*" -or $_.CommandLine -like "*doubaogongzuo*")
+        }
     foreach ($p in $oldProcs) {
         try {
             Stop-Process -Id $p.ProcessId -Force -ErrorAction Stop

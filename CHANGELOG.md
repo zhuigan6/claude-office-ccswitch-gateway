@@ -3,6 +3,11 @@
 本文件遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/) 格式，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。给人看，不放 git log。
 
+## [3.1.1] - 2026-09-06
+
+### Fixed
+- `install.ps1` 旧进程清理限定在**本安装目录**（含已知旧版路径迁移）：此前会误杀本机其他副本的网关进程（干净机测试时发现并复现修复）
+
 ## [3.1.0] - 2026-09-06
 
 主题：零 Python 安装 + 端到端测试安全网（ADR-0007）。
