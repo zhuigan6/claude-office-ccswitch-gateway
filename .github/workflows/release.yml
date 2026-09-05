@@ -1,0 +1,46 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    # 打 tag 即自动发布：仓库 + 官方嵌入式 Python 运行时 打成 zip（用户零 Python 安装）
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Assemble bundle (repo + embeddable Python)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $tag = $env:GITHUB_REF_NAME
+          New-Item -ItemType Directory -Path dist | Out-Null
+          git archive --format=zip -o dist\src.zip HEAD
+          Expand-Archive dist\src.zip -DestinationPath dist\bundle
+          Remove-Item dist\src.zip
+          $pyver = "3.11.9"
+          Invoke-WebRequest "https://www.python.org/ftp/python/$pyver/python-$pyver-embed-amd64.zip" -OutFile dist\py.zip
+          Expand-Archive dist\py.zip -DestinationPath dist\bundle\_python
+          Remove-Item dist\py.zip
+          Compress-Archive -Path dist\bundle\* -DestinationPath "dist\ClaudeOfficeGateway-$tag-windows-x64.zip"
+          Get-ChildItem dist | Select-Object Name, Length
+
+      - name: SHA256SUMS
+        shell: pwsh
+        run: |
+          $f = Get-ChildItem dist\*.zip
+          $h = (Get-FileHash $f.FullName -Algorithm SHA256).Hash
+          "$($h.ToLower())  $($f.Name)" | Out-File -Encoding ascii dist\SHA256SUMS.txt
+          Get-Content dist\SHA256SUMS.txt
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          gh release create "$env:GITHUB_REF_NAME" dist\*.zip dist\SHA256SUMS.txt --generate-notes --title "$env:GITHUB_REF_NAME"

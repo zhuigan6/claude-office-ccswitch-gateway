@@ -35,14 +35,22 @@ CC Switch 当前供应商（GUI 一键切换，按请求热生效）
 | 需要 | 说明 |
 | --- | --- |
 | Windows 10/11（macOS 见[说明](docs/MACOS-NOTES.md)） | 网关为跨平台纯标准库，macOS 适配进行中 |
-| [Python 3.9+](https://www.python.org/downloads/) | 安装时勾选 Add to PATH；无需任何 pip 依赖 |
+| Python 运行时 | **下载 Release 包则不需要**——包内自带官方嵌入式运行时；用 git 安装才需要 Python 3.9+ |
 | [CC Switch](https://github.com/farion1231/cc-switch) | 已配置至少一个 **Claude 分类**供应商并启用 |
 | Microsoft Office（Word/Excel/PPT） | 已安装官方 Claude 加载项（打开侧栏能用网页版即可） |
 
 ## 三步上手
 
+**方式一（推荐，零 Python 安装）**：
+
+1. 到 [Releases](../../releases) 下载最新的 `ClaudeOfficeGateway-vX.Y.Z-windows-x64.zip`，解压到固定目录（如 `C:\Tools\ClaudeOfficeGateway`；不要放 OneDrive/临时/下载目录）
+2. 双击 `install.bat`
+3. Office 侧配置（见下）→ `verify.ps1` 验收
+
+**方式二（git/开发者）**：
+
 ```powershell
-# 1. 把本仓库放到固定目录（如 C:\Tools\ClaudeOfficeGateway），进入目录，一键安装
+# 1. 克隆仓库到固定目录，进入目录，一键安装（无 Python 时自动下载嵌入式运行时）
 powershell -ExecutionPolicy Bypass -File .\install.ps1
 
 # 2. Office 侧二选一：
@@ -68,7 +76,8 @@ powershell -ExecutionPolicy Bypass -File .\verify.ps1
 
 | 现象 | 处理 |
 | --- | --- |
-| 加载项显示 `Could not reach gateway` / `Failed to fetch` | 跑 `verify.ps1`；若 8790 端口在但健康失败属假死，守护会在约 20 秒内自动恢复 |
+| 加载项显示 `Could not reach gateway` / `Failed to fetch` | 跑 `.\diagnose.ps1` 一键诊断（自动脱敏可直接贴 Issue）；若 8790 端口在但健康失败属假死，守护会在约 20 秒内自动恢复 |
+| 一定要安装 Python 吗？ | **不需要**。Release 包自带官方嵌入式运行时（见 [ADR-0007](docs/adr/0007-bundled-embeddable-runtime.md)）；git 方式安装且没有 Python 时，install.ps1 也会自动下载嵌入式运行时 |
 | `502 inference gateway` | 网关已收到请求但连不上 15721 或上游：确认 CC Switch 正在运行且当前供应商可用；不要动 Office 配置 |
 | `Something went wrong` | 多为工具定义兼容问题，网关已自动转换/重试；仍失败请到 Issues 反馈（附 `runtime\last-upstream-error.txt`，**先删掉其中的密钥**） |
 | 模型列表只有一个/不更新 | 在 CC Switch 确认当前供应商已配置 Claude 模型槽位映射；切换后重开侧栏 |

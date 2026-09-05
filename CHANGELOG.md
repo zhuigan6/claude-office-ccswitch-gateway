@@ -3,6 +3,21 @@
 本文件遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/) 格式，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。给人看，不放 git log。
 
+## [3.1.0] - 2026-09-06
+
+主题：零 Python 安装 + 端到端测试安全网（ADR-0007）。
+
+### Added
+- **Release 自带嵌入式 Python 运行时**：打 tag 自动把"仓库 + 官方嵌入式 Python"打成 zip 发布——用户下载解压双击 `install.bat` 即装，无需安装 Python（见 ADR-0007）
+- `install.bat` 双击安装入口（参数原样透传给 install.ps1）
+- **端到端测试**：CI 内起真实网关子进程 + mock CC Switch 上游，覆盖消息转发、4xx 自动深清洗重试、流式转发、文件内联全链路（tests/test_e2e.py）
+- `install.ps1` 安装前自动迁移：停掉旧版网关/守护进程、移除旧版自启键、检测端口占用并明确报错（不再抢端口）
+- `diagnose.ps1` 一键诊断：健康/通道/进程/自启/日志尾部一键收集，令牌密钥自动打码，可直接贴 Issue
+
+### Changed
+- 流式转发增加 **SSE 畸形事件防护**：`data:` 载荷逐行校验，坏事件替换为明确的 `gateway_bad_event` 而非让 Office 前端解析崩溃
+- `install.ps1` 运行时优先级：自带 `_python\` → 系统 Python → 自动下载官方嵌入式运行时（兜底）
+
 ## [3.0.0] - 2026-09-06
 
 统一两台实测机器的两套实现，首个准备公开发布的版本。

@@ -1,6 +1,10 @@
 # 密钥与本地配置
 .env
 
+# 自带嵌入式运行时（Release 打包时由 CI 注入 / install.ps1 自动下载）
+_python/
+_python-download.zip
+
 # 运行期数据（文件库、日志、临时产物）
 runtime/
 data/

@@ -3,28 +3,34 @@
 ## 前提
 
 - Windows 10/11
-- [Python 3.9+](https://www.python.org/downloads/)（安装勾选 *Add python.exe to PATH*；网关纯标准库，不需要任何 pip 依赖）
+- Python 运行时三选一（**推荐①**）：
+  ① 从 [Releases](../../releases) 下载的发布包**自带官方嵌入式运行时**，无需安装 Python
+  ② 已安装 [Python 3.9+](https://www.python.org/downloads/)（勾选 *Add python.exe to PATH*）
+  ③ 都没有也行——`install.ps1` 会自动下载嵌入式运行时到本项目目录（约 11MB，不写系统、免管理员）
 - [CC Switch](https://github.com/farion1231/cc-switch) 已安装，并配置好至少一个 **Claude 分类**的供应商、设为当前启用
 - Microsoft Office（Word/Excel/PPT）
 
 ## 安装
 
-1. 把整个仓库放到**固定目录**（例：`C:\Tools\ClaudeOfficeGateway`）。
+1. 把发布包（或克隆的仓库）放到**固定目录**（例：`C:\Tools\ClaudeOfficeGateway`）。
    ⚠️ 不要放 OneDrive、临时目录或下载目录——安装脚本会拒绝并提示。
-2. 在该目录打开 PowerShell：
+2. 安装（二选一）：
+   - **双击 `install.bat`**（发布包推荐）
+   - 或在目录里打开 PowerShell：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\install.ps1
 ```
 
-脚本会依次：检查 Python →（可选）安装增强依赖 → 生成 `.env` → 注册开机自启（用户级计划任务，免管理员；被组策略拒绝时自动回退注册表 Run 键）→ 启动网关 → 等待 `/healthz` 就绪。
+安装脚本会依次：**停掉旧版网关/守护进程并迁移旧自启** → 检查端口占用（被无关程序占用会明确报错，不抢端口）→ 检查运行时 → （可选）安装增强依赖 → 生成 `.env` → 注册开机自启（用户级计划任务，免管理员；被组策略拒绝时自动回退注册表 Run 键）→ 启动网关 → 等待 `/healthz` 就绪。
 
 可选参数：
 
 ```powershell
-.\install.ps1 -WithExtras      # 同时安装 pypdf/python-docx/openpyxl/python-pptx（PDF/Office 提取更强）
-.\install.ps1 -Port 8787       # 换端口（默认 8790）
-.\install.ps1 -NoAutostart     # 不注册开机自启
+.\install.bat                      # 双击即可（参数会透传）
+.\install.ps1 -WithExtras          # 同时安装 pypdf/python-docx/openpyxl/python-pptx（PDF/Office 提取更强；自带运行时下不可用，见提示）
+.\install.ps1 -Port 8787           # 换端口（默认 8790）
+.\install.ps1 -NoAutostart         # 不注册开机自启
 ```
 
 ## Office 接入（二选一）
@@ -74,8 +80,9 @@ Start-Process -FilePath "<pythonw路径>" -ArgumentList '"C:\Tools\ClaudeOfficeG
 
 | 看什么 | 位置 |
 | --- | --- |
+| 一键诊断（推荐，可直接贴 Issue） | `.\diagnose.ps1 -OutFile diagnose-report.txt`（令牌密钥自动打码） |
 | 实时状态（通道/供应商/模型槽位） | `curl.exe --noproxy "*" http://127.0.0.1:8790/status/ccswitch` |
-| 守护与网关 stdout/stderr | `runtime\supervisor.lock`、`runtime\edge-sup.out`、`runtime\edge-sup.err` |
+| 守护与网关 stdout/stderr | `runtime\edge-sup.out`、`runtime\edge-sup.err` |
 | 最近一次上游 4xx 原文 | `runtime\last-upstream-error.txt` |
 | 访问日志（脱敏，2MB 轮转） | `runtime\edge-access.log` |
 

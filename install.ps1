@@ -1,8 +1,10 @@
-﻿# install.ps1 —— 一键安装：环境自检 -> 生成 .env -> 注册开机自启 -> 启动并等待健康
+﻿# install.ps1 —— 一键安装：旧版迁移 -> 环境自检 -> 生成 .env -> 注册开机自启 -> 启动并等待健康
 # 用法：
+#   双击 install.bat（等价于下面的命令）
 #   powershell -ExecutionPolicy Bypass -File .\install.ps1                # 标准安装
 #   powershell -ExecutionPolicy Bypass -File .\install.ps1 -WithExtras    # 额外安装 PDF/Office 增强解析依赖
 #   powershell -ExecutionPolicy Bypass -File .\install.ps1 -NoAutostart   # 不注册开机自启
+#   powershell -ExecutionPolicy Bypass -File .\install.ps1 -Port 8787     # 换端口
 [CmdletBinding()]
 param(
     [int]$Port = 8790,
@@ -20,32 +22,89 @@ if ($root -match "(?i)\\OneDrive\\|\\AppData\\Local\\Temp\\|\\Downloads\\") {
     throw "请把本仓库放到固定目录（不要放 OneDrive/临时/下载目录）后再安装。当前路径：$root"
 }
 
-# 2) Python 自检（网关纯标准库，无需 pip 依赖）
-$python = $null
-foreach ($candidate in @((Get-Command "py" -ErrorAction SilentlyContinue), (Get-Command $PythonCommand -ErrorAction SilentlyContinue))) {
-    if ($candidate) {
-        $ver = & $candidate.Source -c "import sys;print('%d.%d'%sys.version_info[:2])" 2>$null
-        if ($LASTEXITCODE -eq 0 -and $ver) {
-            $major, $minor = $ver.Split('.')
-            if ([int]$major -ge 3 -and [int]$minor -ge 9) { $python = $candidate.Source; break }
-        }
+# 2) 旧版/残留迁移：按"先守护后网关"顺序停旧进程（避免守护重拉网关），移除旧自启键
+foreach ($pattern in @('supervisor\.py|Supervisor\.ps1', 'office_edge\.py')) {
+    $oldProcs = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+        Where-Object { $_.CommandLine -match $pattern }
+    foreach ($p in $oldProcs) {
+        try {
+            Stop-Process -Id $p.ProcessId -Force -ErrorAction Stop
+            Write-Host ("已停止旧网关/守护进程 pid={0}" -f $p.ProcessId)
+        } catch { }  # 父进程终止时子进程可能已一并退出
+    }
+    if ($oldProcs) { Start-Sleep -Seconds 1 }
+}
+$legacyRun = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
+if (Get-ItemProperty -Path $legacyRun -Name "CCSwitchOfficeSupervisor" -ErrorAction SilentlyContinue) {
+    Remove-ItemProperty -Path $legacyRun -Name "CCSwitchOfficeSupervisor"
+    Write-Host "已移除旧版自启键 CCSwitchOfficeSupervisor（迁移到新的自启方式）"
+}
+
+# 3) 端口占用检查：剩余占用者若非本项目进程，直接报错而不是抢端口
+$listeners = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue
+if ($listeners) {
+    foreach ($c in $listeners) {
+        $proc = Get-Process -Id $c.OwningProcess -ErrorAction SilentlyContinue
+        throw "端口 $Port 已被占用（pid=$($c.OwningProcess) $($proc.ProcessName)）。请关闭该程序，或用 -Port 换一个端口重试。"
     }
 }
-if (-not $python) { throw "未找到 Python 3.9+。请先安装 Python（python.org），勾选 'Add to PATH'。" }
+
+# 4) Python 运行时：自带 _python 优先 -> 系统 Python -> 自动下载官方嵌入式运行时（约 11MB，仅本项目使用）
+$bundled = Join-Path $root "_python\python.exe"
+if (Test-Path -LiteralPath $bundled) {
+    $python = $bundled
+    Write-Host "[1/5] 使用自带运行时: $python（无需安装 Python）"
+} else {
+    $python = $null
+    foreach ($candidate in @((Get-Command "py" -ErrorAction SilentlyContinue), (Get-Command $PythonCommand -ErrorAction SilentlyContinue))) {
+        if ($candidate) {
+            $ver = & $candidate.Source -c "import sys;print('%d.%d'%sys.version_info[:2])" 2>$null
+            if ($LASTEXITCODE -eq 0 -and $ver) {
+                $major, $minor = $ver.Split('.')
+                if ([int]$major -ge 3 -and [int]$minor -ge 9) { $python = $candidate.Source; break }
+            }
+        }
+    }
+    if (-not $python) {
+        # 自动下载官方嵌入式 Python（PSF 许可证允许再分发；解压到 _python\，不写系统、不需要管理员）
+        $pyver = "3.11.9"
+        $url = "https://www.python.org/ftp/python/$pyver/python-$pyver-embed-amd64.zip"
+        Write-Host "[1/5] 未检测到系统 Python，正在下载官方嵌入式运行时（约 11MB，仅本项目使用）..."
+        try {
+            [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+            $zipPath = Join-Path $root "_python-download.zip"
+            Invoke-WebRequest -Uri $url -OutFile $zipPath -UseBasicParsing
+            $pyDir = Join-Path $root "_python"
+            if (Test-Path -LiteralPath $pyDir) { Remove-Item -LiteralPath $pyDir -Recurse -Force }
+            Expand-Archive -LiteralPath $zipPath -DestinationPath $pyDir -Force
+            Remove-Item -LiteralPath $zipPath -Force
+            $python = $bundled
+        } catch {
+            throw "自动下载运行时失败（$($_.Exception.Message)）。请安装 Python 3.9+（python.org，勾选 Add to PATH）后重试。"
+        }
+        Write-Host "[1/5] 嵌入式运行时就绪: $python"
+    } else {
+        Write-Host "[1/5] Python OK: $python"
+    }
+}
 $pythonw = $python -replace 'python\.exe$', 'pythonw.exe'
 if (-not (Test-Path -LiteralPath $pythonw)) { $pythonw = $python }
-Write-Host "[1/5] Python OK: $python"
+$usingBundled = ($python -eq $bundled)
 
-# 3) 可选增强依赖（PDF/Office 文本提取质量更好；不装也能跑，自动退回内置解析）
+# 5) 可选增强依赖（PDF/Office 文本提取质量更好；不装也能跑，自动退回内置解析）
 if ($WithExtras) {
-    Write-Host "[2/5] 安装可选增强依赖 pypdf python-docx openpyxl python-pptx ..."
-    & $python -m pip install --disable-pip-version-check pypdf python-docx openpyxl python-pptx
-    if ($LASTEXITCODE -ne 0) { Write-Warning "可选依赖安装失败，网关将使用内置标准库解析（功能略简化）。" }
+    if ($usingBundled) {
+        Write-Warning "自带运行时不支持 pip 安装增强依赖；如需增强解析，请安装系统 Python 3.9+ 后重跑 -WithExtras。"
+    } else {
+        Write-Host "[2/5] 安装可选增强依赖 pypdf python-docx openpyxl python-pptx ..."
+        & $python -m pip install --disable-pip-version-check pypdf python-docx openpyxl python-pptx
+        if ($LASTEXITCODE -ne 0) { Write-Warning "可选依赖安装失败，网关将使用内置标准库解析（功能略简化）。" }
+    }
 } else {
     Write-Host "[2/5] 跳过可选增强依赖（-WithExtras 可安装）"
 }
 
-# 4) 生成 .env（已有则保留，绝不覆盖用户配置）
+# 6) 生成 .env（已有则保留，绝不覆盖用户配置）
 $envPath = Join-Path $root ".env"
 if (-not (Test-Path -LiteralPath $envPath)) {
     $template = Get-Content -LiteralPath (Join-Path $root ".env.example") -Raw -Encoding UTF8
@@ -56,7 +115,7 @@ if (-not (Test-Path -LiteralPath $envPath)) {
     Write-Host "[3/5] 已存在 .env，保持不变"
 }
 
-# 5) 开机自启：优先用户级计划任务（免管理员）；失败则回退 HKCU Run 注册表键
+# 7) 开机自启：优先用户级计划任务（免管理员）；失败则回退 HKCU Run 注册表键
 $autostart = "task"
 if (-not $NoAutostart) {
     Write-Host "[4/5] 注册开机自启 ..."
@@ -81,10 +140,9 @@ if (-not $NoAutostart) {
     $autostart = "none"
 }
 
-# 6) 启动并等待健康
+# 8) 启动并等待健康
 Write-Host "[5/5] 启动网关并等待 /healthz ..."
 if ($autostart -eq "task") { Start-ScheduledTask -TaskName $TaskName }
-elseif ($autostart -eq "runkey") { Start-Process -FilePath $pythonw -ArgumentList ('"{0}"' -f (Join-Path $root "supervisor.py")) -WorkingDirectory $root }
 else { Start-Process -FilePath $pythonw -ArgumentList ('"{0}"' -f (Join-Path $root "supervisor.py")) -WorkingDirectory $root }
 
 $deadline = [DateTime]::UtcNow.AddSeconds(30)
@@ -97,7 +155,7 @@ do {
     } catch { }
 } while (-not $healthy -and [DateTime]::UtcNow -lt $deadline)
 
-if (-not $healthy) { throw "网关已启动流程完成，但 /healthz 在 30 秒内未就绪。请查看 runtime\edge-sup.err 与 runtime\edge-sup.out。" }
+if (-not $healthy) { throw "网关已启动流程完成，但 /healthz 在 30 秒内未就绪。请运行 .\diagnose.ps1 查看诊断，或查看 runtime\edge-sup.err。" }
 
 Write-Host ""
 Write-Host "=== 安装完成：网关运行于 http://127.0.0.1:$Port （自启方式：$autostart）==="

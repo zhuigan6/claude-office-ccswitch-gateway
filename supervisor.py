@@ -10,6 +10,7 @@ supervisor.py —— 网关守护进程（纯标准库）
 
 由计划任务或 HKCU Run 在用户登录时启动（见 install.ps1）。
 """
+import ctypes
 import json
 import os
 import re
@@ -55,24 +56,47 @@ def _log(*a):
     print("[supervisor]", time.strftime("%H:%M:%S"), *a, flush=True)
 
 
-def acquire_lock() -> bool:
-    """单实例：锁文件 + 存活 pid 检查（跨平台，无需管理员权限）。"""
-    os.makedirs(DATA_DIR, exist_ok=True)
+def _pid_alive(pid: int) -> bool:
+    """只读探活。注意不能用 os.kill(pid, 0)：Windows 上那会调 TerminateProcess 误杀活进程。"""
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        try:
+            k32 = ctypes.windll.kernel32
+            handle = k32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+            if not handle:
+                return False
+            k32.CloseHandle(handle)
+            return True
+        except Exception:
+            return False
     try:
-        if os.path.exists(LOCK_FILE):
-            try:
-                with open(LOCK_FILE, "r", encoding="utf-8") as fh:
-                    old_pid = int(fh.read().strip() or 0)
-                os.kill(old_pid, 0)  # 进程仍活着（Windows 上对其他进程会抛 PermissionError，同样视为活着）
-                _log(f"another supervisor is running (pid {old_pid}), exiting")
-                return False
-            except (ValueError, ProcessLookupError):
-                pass  # 残留锁文件，接管
-            except PermissionError:
-                _log("another supervisor is running, exiting")
-                return False
-            except OSError:
-                pass
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def acquire_lock() -> bool:
+    """单实例：锁文件 + 存活 pid 检查。残留的死锁文件自动接管。"""
+    os.makedirs(DATA_DIR, exist_ok=True)
+    if os.path.exists(LOCK_FILE):
+        old_pid = 0
+        try:
+            with open(LOCK_FILE, "r", encoding="utf-8") as fh:
+                old_pid = int(fh.read().strip() or 0)
+        except (ValueError, OSError):
+            old_pid = 0
+        if old_pid and _pid_alive(old_pid):
+            _log(f"another supervisor is running (pid {old_pid}), exiting")
+            return False
+        try:  # 死锁残留：接管
+            os.remove(LOCK_FILE)
+        except OSError:
+            pass
+    try:
         fd = os.open(LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(str(os.getpid()))

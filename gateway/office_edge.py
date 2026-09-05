@@ -93,7 +93,7 @@ MAX_FILE_BYTES = int(os.getenv("EDGE_MAX_FILE_BYTES", str(32 * 1024 * 1024)))
 MAX_EXTRACT_CHARS = int(os.getenv("EDGE_MAX_EXTRACT_CHARS", "60000"))
 ACCESS_LOG = os.path.join(DATA_DIR, "edge-access.log")
 ACCESS_LOG_MAX = int(os.getenv("EDGE_ACCESS_LOG_MAX", str(2 * 1024 * 1024)))
-VERSION = "3.0"
+VERSION = "3.1"
 
 # 到 127.0.0.1 的转发绝不走系统代理（http.client 本身不读环境代理，这里再兜底，防止 502 no body）
 for _k in ("NO_PROXY", "no_proxy"):
@@ -782,6 +782,28 @@ def _upstream_headers(handler):
     return h
 
 
+def _checked_sse_line(line: bytes) -> bytes:
+    """校验一行 SSE：data: 载荷必须是合法 JSON（[DONE] 除外）；
+    畸形则替换为明确的 error 事件并丢弃原始行。其余行原样放行。"""
+    s = line.strip()
+    if not s.startswith(b"data: "):
+        return line + b"\n"
+    payload = s[6:]
+    if not payload or payload == b"[DONE]":
+        return line + b"\n"
+    try:
+        json.loads(payload)
+    except Exception as exc:
+        _log("malformed upstream sse data dropped:",
+             type(exc).__name__, payload[:120])
+        safe = json.dumps({"type": "error",
+                           "error": {"type": "gateway_bad_event",
+                                     "message": "Dropped malformed upstream data event"}},
+                          ensure_ascii=False)
+        return ("event: error\ndata: %s\n\n" % safe).encode("utf-8")
+    return line + b"\n"
+
+
 def upstream_roundtrip(handler, upstream_path, payload, stream, sanitized=False):
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     host, port, _ = _split_base(CCSWITCH_BASE)
@@ -806,12 +828,20 @@ def upstream_roundtrip(handler, upstream_path, payload, stream, sanitized=False)
             return handler.proxy_response(resp.status, err, [("Content-Type", ct)])
         if stream:
             handler.begin_sse(resp.status)
+            # 逐行校验 data: 载荷后再转发：畸形事件替换为明确的 gateway_bad_event，
+            # 避免让 Office 前端的 JSON 解析崩溃（对齐另一台实测机器的健壮性设计）。
+            buf = b""
             try:
                 while True:
-                    chunk = resp.read(1024)
+                    chunk = resp.read(2048)
                     if not chunk:
                         break
-                    handler.write_chunk(chunk)
+                    buf += chunk
+                    *lines, buf = buf.split(b"\n")
+                    for line in lines:
+                        handler.write_chunk(_checked_sse_line(line))
+                if buf.strip():  # 上游断流时的残尾行
+                    handler.write_chunk(_checked_sse_line(buf))
             finally:
                 handler.end_sse(); conn.close()
         else:
