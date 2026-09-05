@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+        python-version: ["3.9", "3.13"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Syntax compile
+        run: |
+          python -m py_compile gateway/office_edge.py supervisor.py tools/verify_gateway.py tests/test_gateway.py
+      - name: Unit tests
+        run: python -m unittest discover -s tests -v
+
+  ps1:
+    # Windows 专属：PowerShell 语法 + UTF-8 BOM 检查
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: PowerShell syntax check
+        shell: pwsh
+        run: |
+          $files = Get-ChildItem -Recurse -Filter *.ps1
+          $fail = $false
+          foreach ($f in $files) {
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($f.FullName, [ref]$null, [ref]$errors) | Out-Null
+            if ($errors.Count -gt 0) { Write-Host "SYNTAX FAIL: $($f.Name)"; $fail = $true }
+            $bytes = [System.IO.File]::ReadAllBytes($f.FullName)
+            if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
+              Write-Host "BOM OK: $($f.Name)"
+            } else {
+              Write-Host "BOM MISSING: $($f.Name) (.ps1 必须带 UTF-8 BOM)"; $fail = $true
+            }
+          }
+          if ($fail) { exit 1 }

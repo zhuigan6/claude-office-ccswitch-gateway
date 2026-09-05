@@ -1,0 +1,35 @@
+# 更新日志
+
+本文件遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/) 格式，
+版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。给人看，不放 git log。
+
+## [3.0.0] - 2026-09-06
+
+统一两台实测机器的两套实现，首个准备公开发布的版本。
+
+### Added
+- 双代 CC Switch 通道自动识别（`claude-desktop` / `claude`，`CCSWITCH_CHANNEL=auto`，见 ADR-0003）
+- 一键安装 `install.ps1`（Python 自检、.env 生成、自启注册、健康等待）与 `uninstall.ps1`
+- 一键验收门 `verify.ps1` + `tools/verify_gateway.py`：健康/模型/CORS+PNA/401/400/404/415/Files 全生命周期（SHA-256 比对），可选 `-RunInference` 真实推理
+- 守护进程 `supervisor.py`：单实例锁、每 5 秒应用层健康探测、连续 3 次失败重启、僵死监听清理
+- 回归测试套件 `tests/`（21 项，纯标准库）与 GitHub Actions CI（Windows/macOS/Linux 矩阵）
+- Files 元数据增加 SHA-256；请求形状脱敏日志（`EDGE_LOG_SHAPE=1`）
+- Office 接入双轨文档与旁加载脚本（`scripts/`，注册表结构经实机验证）
+- 决策记录 docs/adr/（6 篇）
+
+### Changed
+- 网关由本机 v2.0 升级为统一版 v3.0：上游路径/令牌/模型来源不再硬编码（ADR-0003/0004）
+- 自启标准化为"用户级计划任务优先、HKCU Run 回退"（ADR-0005）
+- 文本提取渐进增强：装有 pypdf/python-docx/openpyxl/python-pptx 时自动启用，未装退回标准库（ADR-0002）
+
+### Security
+- `cc-switch.db` 全程只读（`mode=ro`）；网关永不接触真实上游密钥
+- 默认只监听 127.0.0.1；日志脱敏且 2MB 轮转；归档附件明确拒绝不自动解压
+
+## [2.0.0] - 2026-09-01（本机历史版本）
+- loopback 直连取代 cloudflared 隧道（ADR-0001）
+- 透明优先 + 4xx 自动深清洗重试一次；Files API（原子写、过期清理、句柄泄漏修复）
+- 访问日志轮转；CORS/PNA 预检修复
+
+## [1.x] - 2026-08（本机历史版本）
+- 初版隧道方案与 Office 旁加载打通（细节见原机交接档案）

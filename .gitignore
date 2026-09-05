@@ -1,0 +1,25 @@
+# 密钥与本地配置
+.env
+
+# 运行期数据（文件库、日志、临时产物）
+runtime/
+data/
+*.db
+*.db-shm
+*.db-wal
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# 系统与编辑器
+Thumbs.db
+.DS_Store
+*.swp
+
+# 测试残留
+*.tmp
