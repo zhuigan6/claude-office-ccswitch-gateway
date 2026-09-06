@@ -38,6 +38,32 @@
 ## D. 排障决策树
 
 ```text
+Office 弹「安装加载项时出错：安装或加载所需资源失败」
+  ├─ 先判定：侧栏还能正常对话吗？
+  │    ├─ 能 → 无害弹窗。失败的是外围资源（图标/快捷键映射，全部托管在
+  │    │      pivot.claude.ai，与本机网关无关）；核心功能无损。
+  │    │      处置：完全退出该 Office 应用（所有窗口）再重开一次即自愈
+  │    │      （每次启动会自动重试拉取）；无需任何修复。
+  │    └─ 不能 → 按下方标准分层排障（healthz → verify → diagnose）
+  ├─ 弹窗每次启动都出现且持续超过 1 天 → .\diagnose.ps1 -OutFile report.txt
+  │    （自动脱敏）→ 附报告提 Issue；大概率是某资源被缓存为失败状态
+  └─ ⚠️ 铁律：绝对禁止清除/删除 %LOCALAPPDATA%\Microsoft\Office\16.0\Wef\
+       目录！网上常见的"清 Wef 缓存"偏方会把用户聊天历史（IndexedDB）
+       一起清掉，永久丢失，不可恢复。
+
+  背景知识（已实测验证）：
+  · 清单声明的"所需资源"全部指向 https://pivot.claude.ai（图标 icon-*.png、
+    快捷键映射 shortcuts.json、任务窗格页面本身），本机网关地址只是 URL 里
+    的查询参数——网关健康与否与此弹窗无因果关系。
+  · 三个 Office 应用各自独立缓存（Wef\AggregatedCache\ShortcutsMapping.
+    <App>.zh-CN 等），一个应用失败不影响其他；失败的应用每次启动重试，
+    服务恢复后自动重建，弹窗随之消失。
+  · 实测案例（2026-09-06）：官方站点 14:39~14:41 重新部署期间，PowerPoint
+    恰好第一个加载、shortcuts.json 拉取失败弹窗；Word/Excel 晚 1~2 分钟
+    重建成功无弹窗；期间对话始终正常。
+```
+
+```text
 Office 报 Could not reach gateway / Failed to fetch
   ├─ curl --noproxy "*" http://127.0.0.1:8790/healthz
   │    ├─ 200 且 status=ok → 网关正常；问题在 Office 侧配置 → 检查方式 A 的四项参数 / 方式 B 旁加载
