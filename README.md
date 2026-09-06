@@ -1,6 +1,6 @@
 # Claude Office × CC Switch 本地网关
 
-**English**: A local, zero-cloud adapter that lets the Claude add-in inside Microsoft Word / Excel / PowerPoint use the provider you have selected in [CC Switch](https://github.com/farion1231/cc-switch) — hot-switching providers per request, purely on `127.0.0.1`.
+**中文** | [English](README.en.md)
 
 ---
 
