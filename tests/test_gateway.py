@@ -330,5 +330,76 @@ class TestExperienceFidelity(unittest.TestCase):
             office_edge.files_delete(meta["id"])
 
 
+class TestV33(unittest.TestCase):
+    """v3.3：结构化错误码、磁盘配额、结构漂移诊断、数据目录完整性。"""
+
+    def test_gateway_error_shape(self):
+        out = office_edge._gateway_error("invalid_gateway_token", "bad token",
+                                         "check token", "authentication_error")
+        self.assertEqual(out["type"], "error")
+        self.assertEqual(out["error"]["type"], "authentication_error")
+        self.assertEqual(out["error"]["code"], "invalid_gateway_token")
+        self.assertEqual(out["error"]["suggestion"], "check token")
+        self.assertNotIn("suggestion", office_edge._gateway_error("x", "m")["error"])
+
+    def test_quota_exceeded(self):
+        old = office_edge.FILE_QUOTA_BYTES
+        office_edge.FILE_QUOTA_BYTES = 10
+        try:
+            office_edge.files_create("a.txt", "text/plain", b"x" * 8, "user_message", 60)
+            with self.assertRaises(office_edge.FileInlineError) as cm:
+                office_edge.files_create("b.txt", "text/plain", b"y" * 8, "user_message", 60)
+            self.assertEqual(cm.exception.code, 413)
+            self.assertEqual(cm.exception.gateway_code, "quota_exceeded")
+        finally:
+            office_edge.FILE_QUOTA_BYTES = old
+            office_edge._enforce_quota()  # 清掉测试写入的文件
+
+    def test_schema_drift_diagnosis(self):
+        db = os.path.join(tempfile.gettempdir(), "cc-drift-%d.db" % os.getpid())
+        con = sqlite3.connect(db)
+        con.execute("CREATE TABLE providers (id TEXT, name TEXT, app_type TEXT, is_current INTEGER, settings_config TEXT)")
+        con.execute("INSERT INTO providers VALUES ('1','P','claude-desktop',1,'{}')")
+        con.commit()
+        con.close()
+        old_db = office_edge.CCSWITCH_DB
+        office_edge.CCSWITCH_DB = db
+        try:
+            state = office_edge.read_ccswitch_state(force=True)
+            self.assertEqual(state.get("diagnosis"), "ccswitch_schema_drift")
+            self.assertIn("Issue", state.get("suggestion", ""))
+        finally:
+            office_edge.CCSWITCH_DB = old_db
+            os.remove(db)
+            office_edge.read_ccswitch_state(force=True)
+
+    def test_no_current_provider_diagnosis(self):
+        db = os.path.join(tempfile.gettempdir(), "cc-empty-%d.db" % os.getpid())
+        con = sqlite3.connect(db)
+        con.execute("CREATE TABLE providers (id TEXT, name TEXT, app_type TEXT, "
+                    "is_current INTEGER, settings_config TEXT, meta TEXT)")
+        con.execute("CREATE TABLE settings (key TEXT, value TEXT)")
+        con.commit()
+        con.close()
+        old_db = office_edge.CCSWITCH_DB
+        office_edge.CCSWITCH_DB = db
+        try:
+            state = office_edge.read_ccswitch_state(force=True)
+            self.assertEqual(state.get("diagnosis"), "no_current_provider")
+        finally:
+            office_edge.CCSWITCH_DB = old_db
+            os.remove(db)
+            office_edge.read_ccswitch_state(force=True)
+
+    def test_files_integrity_detects_missing_objects(self):
+        meta = office_edge.files_create("ghost.txt", "text/plain", b"data", "user_message", 60)
+        try:
+            os.remove(os.path.join(office_edge.FILES_DIR, meta["id"]))
+            self.assertEqual(office_edge.verify_files_integrity(), 1)
+        finally:
+            office_edge.files_delete(meta["id"])
+            self.assertEqual(office_edge.verify_files_integrity(), 0)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -85,6 +85,33 @@ Add-Line ("HKCU Run 'Claude Office Gateway': " + $(if ($runVal) { $runVal } else
 Add-Line ("HKCU Run 旧键 'CCSwitchOfficeSupervisor': " +
     $(if ((Get-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -ErrorAction SilentlyContinue)."CCSwitchOfficeSupervisor") { "仍存在（旧版残留）" } else { "不存在" }))
 
+Add-Section "WebView2 / Office 加载项环境"
+$pv = (Get-ItemProperty -Path "HKLM:\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}" -ErrorAction SilentlyContinue).pv
+if (-not $pv) { $pv = (Get-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}" -ErrorAction SilentlyContinue).pv }
+Add-Line ("WebView2 Runtime: " + $(if ($pv) { $pv } else { "未检测到（Office 加载项将无法运行）" }))
+$wef = Join-Path $env:LOCALAPPDATA "Microsoft\Office\16.0\Wef"
+if (Test-Path -LiteralPath $wef) {
+    $wv2 = Join-Path $wef "webview2"
+    $slots = if (Test-Path -LiteralPath $wv2) { (Get-ChildItem -LiteralPath $wv2 -Directory -ErrorAction SilentlyContinue).Count } else { 0 }
+    Add-Line ("Office Wef 目录存在；WebView 数据槽位数量: " + $slots + "（仅统计，不读取内容）")
+    Add-Line "提示：聊天历史保存在对应槽位的 IndexedDB 中；槽位数量突然变化通常意味着 Office 升级换了存储槽。"
+} else {
+    Add-Line "Office Wef 目录不存在（Office 可能未运行过加载项）"
+}
+
+Add-Section "版本检查（按需联网，无后台外呼）"
+try {
+    $rel = Invoke-RestMethod -Uri "https://api.github.com/repos/zhuigan6/claude-office-ccswitch-gateway/releases/latest" -TimeoutSec 6
+    $local = $null
+    try { $local = (Invoke-RestMethod -Uri "http://127.0.0.1:$Port/healthz" -TimeoutSec 2).version } catch { }
+    Add-Line ("本地网关: " + $(if ($local) { $local } else { "未运行" }) + "   最新 Release: " + $rel.tag_name)
+    if ($local -and (($rel.tag_name -replace '^v', '') -ne [string]$local)) {
+        Add-Line "提示：有新版本。升级方式见 docs\DEPLOYMENT-WINDOWS.md（git pull 或重新下载解压后重跑 install.ps1）。"
+    }
+} catch {
+    Add-Line ("跳过（离线或 GitHub API 不可达）: " + $_.Exception.Message)
+}
+
 Add-Section "日志尾部（已脱敏）"
 foreach ($f in @("edge-sup.err", "edge-sup.out")) {
     $p = Join-Path $root ("runtime\" + $f)

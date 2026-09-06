@@ -3,6 +3,22 @@
 本文件遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/) 格式，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。给人看，不放 git log。
 
+## [3.3.0] - 2026-09-06
+
+主题：可运维性——报错可行动、磁盘有配额、故障能自述。
+
+### Added
+- **结构化错误码 + 修复建议**：网关自身错误（401/502/400/413/附件类）带 `error.code`（如 `invalid_gateway_token`、`ccswitch_unreachable`、`quota_exceeded`）与 `error.suggestion`，加载项内和排障脚本都可按 code 行动
+- **磁盘配额与后台维护**：附件总配额 `EDGE_FILE_QUOTA_BYTES`（默认 1GiB，0=不限额），超出按最旧淘汰；后台线程按 `EDGE_PRUNE_INTERVAL`（默认 600s）定期清过期
+- **cc-switch 结构漂移诊断**：数据库结构不符时 `/healthz` 明确返回 `ccswitch_schema_drift` + 建议；未配置当前供应商时返回 `no_current_provider`
+- **数据目录完整性自检**：启动时统计"有元数据但缺内容对象"的附件数并告警（目录被部分复制/挪动的信号）
+- **SKILL.md**：AI 代理自助手册——把仓库喂给 Claude Code/Cursor 即可自动完成安装/配置/验收/排障
+- **SECURITY.md / CODE_OF_CONDUCT.md**：安全报告渠道与社区公约；仓库开启 Discussions
+- `diagnose.ps1` 新增 WebView2 Runtime 版本、Office Wef 数据槽位统计（仅计数不读内容）与按需版本检查
+
+### Fixed
+- `read_ccswitch_state` 查询异常时 SQLite 连接未关闭（Windows 上句柄泄漏）
+
 ## [3.2.0] - 2026-09-06
 
 主题：向"真 Claude 体验"对齐——同样的话更快的回应、报错看得懂、附件不再轻易过期（ADR-0008）。

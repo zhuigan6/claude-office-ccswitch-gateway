@@ -23,11 +23,13 @@ CC Switch 当前供应商（GUI 一键切换，按请求热生效）
 ## 功能
 
 - **Anthropic Messages 全量透传**：流式/非流式、thinking、工具调用、图片、附件全部保留；仅当上游明确拒绝某字段时，自动做一次兼容清洗重试
+- **供应商指纹记忆**：某供应商拒绝过哪些字段会被记住，后续请求直接预清洗——不兼容供应商每条消息省一次注定失败的往返；兼容供应商行为完全不变（[ADR-0008](docs/adr/0008-provider-fingerprint-sanitize-memory.md)）
+- **报错看得懂**：网关自身错误带机器可读 `code` + 可行动的 `suggestion`；上游错误归一为官方错误形状
 - **动态模型列表**：`/v1/models` 按当前供应商实时合成 `claude-*` 别名（避免被 Office 过滤），切换供应商后重开侧栏即更新
-- **Files API**：上传/列表/下载/删除，消息引用 `file_id` 自动内联为图片或文本（TXT/MD/CSV/JSON/XML/PDF/DOCX/XLSX/PPTX），归档明确拒绝不解压（防压缩炸弹）
+- **Files API**：上传/列表/下载/删除（默认 24h 有效、总额配额、后台自动清理），消息引用 `file_id` 自动内联为图片或文本（TXT/MD/CSV/JSON/XML/PDF/DOCX/XLSX/PPTX），归档明确拒绝不解压（防压缩炸弹）
 - **自愈常驻**：守护进程每 5 秒健康探测，假死自动重启，开机自启
-- **双代 CC Switch 适配**：自动识别新旧两代的数据库结构与上游路径（见 [ADR-0003](docs/adr/0003-upstream-channel-auto-detect.md)）
-- **一键安装 / 一键验收**：`install.ps1` 装好即用；`verify.ps1` 十几项检查零费用自检
+- **双代 CC Switch 适配**：自动识别新旧两代的数据库结构与上游路径（见 [ADR-0003](docs/adr/0003-upstream-channel-auto-detect.md)），结构再变时给出明确诊断
+- **一键安装 / 一键验收**：`install.ps1`（或双击 `install.bat`）装好即用；`verify.ps1` 验收、`diagnose.ps1` 一键脱敏诊断
 - **可选增强**：`install.ps1 -WithExtras` 安装 pypdf/python-docx/openpyxl/python-pptx，PDF/Office 文本提取质量更好（不装也能跑，自动退回内置解析）
 
 ## 环境要求
@@ -65,6 +67,8 @@ powershell -ExecutionPolicy Bypass -File .\verify.ps1
 ```
 
 然后打开 Word/Excel/PPT 的 Claude 侧栏，正常聊天即为成功。详细图文步骤见 [docs/DEPLOYMENT-WINDOWS.md](docs/DEPLOYMENT-WINDOWS.md)。
+
+**让 AI 代理替你装**：把 [SKILL.md](SKILL.md) 喂给 Claude Code / Cursor 等代理（或直接让它读仓库），它会按手册完成安装、配置、验收和排障。
 
 ## 日常使用
 

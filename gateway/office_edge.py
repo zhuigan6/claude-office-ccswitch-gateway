@@ -91,9 +91,11 @@ LOG_SHAPE = os.getenv("EDGE_LOG_SHAPE", "0") == "1"
 MAX_BODY = int(os.getenv("EDGE_MAX_BODY_BYTES", str(32 * 1024 * 1024)))
 MAX_FILE_BYTES = int(os.getenv("EDGE_MAX_FILE_BYTES", str(32 * 1024 * 1024)))
 MAX_EXTRACT_CHARS = int(os.getenv("EDGE_MAX_EXTRACT_CHARS", "60000"))
+FILE_QUOTA_BYTES = int(os.getenv("EDGE_FILE_QUOTA_BYTES", str(1024 * 1024 * 1024)))  # 附件总配额，0=不限额
+PRUNE_INTERVAL = int(os.getenv("EDGE_PRUNE_INTERVAL", "600"))  # 后台维护间隔（秒）
 ACCESS_LOG = os.path.join(DATA_DIR, "edge-access.log")
 ACCESS_LOG_MAX = int(os.getenv("EDGE_ACCESS_LOG_MAX", str(2 * 1024 * 1024)))
-VERSION = "3.2"
+VERSION = "3.3"
 
 # 到 127.0.0.1 的转发绝不走系统代理（http.client 本身不读环境代理，这里再兜底，防止 502 no body）
 for _k in ("NO_PROXY", "no_proxy"):
@@ -146,6 +148,7 @@ def read_ccswitch_state(force: bool = False) -> dict:
             return _state_cache
         state = {"token": "", "channel": None, "prefix": "", "active": None,
                  "proxy_base": CCSWITCH_BASE}
+        con = None
         try:
             uri = "file:%s?mode=ro" % urllib.parse.quote(CCSWITCH_DB.replace("\\", "/"), safe=":/")
             con = sqlite3.connect(uri, uri=True, timeout=2.0)
@@ -212,11 +215,30 @@ def read_ccswitch_state(force: bool = False) -> dict:
                         entries.append((k, k, active["routes"][k]))
                 else:
                     entries = _slot_entries_from_env(active["env"])
+            if not active and not state.get("error"):
+                state["diagnosis"] = "no_current_provider"
+                state["suggestion"] = ("在 CC Switch 中添加 Claude 分类（旧版为 Claude Desktop 分类）供应商，"
+                                       "配置 claude-* 模型槽位映射并设为当前启用")
             state.update({"channel": channel, "prefix": prefix, "active": active,
                           "model_entries": entries})
             _MODEL_MAP = {picker: semantic for picker, semantic, _ in entries}
             con.close()
+        except sqlite3.OperationalError as exc:
+            if con is not None:
+                try:
+                    con.close()
+                except Exception:
+                    pass
+            state["error"] = f"{type(exc).__name__}: {exc}"
+            state["diagnosis"] = "ccswitch_schema_drift"
+            state["suggestion"] = ("cc-switch 数据库结构与已知的两代均不符（可能为新版本）。"
+                                   "请附上 diagnose.ps1 报告与 CC Switch 版本号提 Issue。")
         except Exception as exc:
+            if con is not None:
+                try:
+                    con.close()
+                except Exception:
+                    pass
             state["error"] = f"{type(exc).__name__}: {exc}"
         _state_cache, _db_mtime = state, mtime
         return state
@@ -455,6 +477,28 @@ def _ensure_anthropic_error(status: int, data: bytes) -> bytes:
                       ensure_ascii=False).encode("utf-8")
 
 
+def _gateway_error(code, message, suggestion=None, err_type="invalid_request_error"):
+    """网关自身产生的错误：Anthropic 形状 + 机器可读 code + 可行动建议（借鉴 OfficeCLI 的结构化错误）。"""
+    err = {"type": err_type, "code": code, "message": message}
+    if suggestion:
+        err["suggestion"] = suggestion
+    return {"type": "error", "error": err}
+
+
+_FILE_ERR_SUGGESTIONS = {
+    "file_not_found": "附件可能已过期或来自其他会话，请重新上传",
+    "file_content_missing": "附件内容丢失（数据目录可能被移动或部分复制），请重新上传",
+    "file_too_large": "附件超过大小上限（EDGE_MAX_FILE_BYTES）",
+    "quota_exceeded": "附件总配额已满（EDGE_FILE_QUOTA_BYTES），可删除旧附件或调高配额",
+    "unsupported_file": "该类型不能直接发给模型；归档(zip/rar/7z 等)请先解压再上传",
+}
+
+
+def _file_error(e):
+    code = getattr(e, "gateway_code", None) or "file_error"
+    return _gateway_error(code, e.message, _FILE_ERR_SUGGESTIONS.get(code))
+
+
 def _shape_summary(payload: dict) -> str:
     """请求形状摘要（不含正文，不泄漏内容）：模型/流式/角色序列/块类型计数。"""
     msgs = payload.get("messages") if isinstance(payload.get("messages"), list) else []
@@ -517,9 +561,56 @@ def prune_expired():
         pass
 
 
+def storage_used() -> int:
+    try:
+        with files_conn() as con:
+            return con.execute("SELECT COALESCE(SUM(size), 0) FROM files").fetchone()[0] or 0
+    except Exception:
+        return 0
+
+
+def _enforce_quota():
+    """磁盘配额：先清过期，仍超额则按最旧优先淘汰。FILE_QUOTA_BYTES<=0 表示不限额。"""
+    if FILE_QUOTA_BYTES <= 0:
+        return
+    prune_expired()
+    with files_conn() as con:
+        rows = con.execute("SELECT id, size FROM files ORDER BY created_at ASC").fetchall()
+    total = sum(int(r[1] or 0) for r in rows)
+    for fid, size in rows:
+        if total <= FILE_QUOTA_BYTES:
+            break
+        files_delete(fid)
+        total -= int(size or 0)
+
+
+def _maintenance_loop():
+    while True:
+        time.sleep(max(60, PRUNE_INTERVAL))
+        try:
+            _enforce_quota()
+        except Exception as exc:
+            _log("maintenance failed:", type(exc).__name__)
+
+
+def start_background_maintenance():
+    threading.Thread(target=_maintenance_loop, daemon=True, name="edge-maintenance").start()
+
+
+def verify_files_integrity() -> int:
+    """启动自检：统计有元数据但缺内容对象的附件数（数据目录被部分复制/挪动的信号）。"""
+    try:
+        with files_conn() as con:
+            ids = [r[0] for r in con.execute("SELECT id FROM files").fetchall()]
+    except Exception:
+        return -1
+    return sum(1 for fid in ids if not os.path.exists(os.path.join(FILES_DIR, fid)))
+
+
 class FileInlineError(Exception):
-    def __init__(self, code, message):
+    def __init__(self, code, message, gateway_code=None):
         super().__init__(message); self.code = code; self.message = message
+        self.gateway_code = gateway_code
 
 
 def _ext(name: str) -> str:
@@ -527,12 +618,15 @@ def _ext(name: str) -> str:
 
 
 def files_create(filename, content_type, data: bytes, purpose, expires_in_seconds):
-    prune_expired()
+    _enforce_quota()
     if len(data) > MAX_FILE_BYTES:
-        raise FileInlineError(413, f"file too large, max {MAX_FILE_BYTES} bytes")
+        raise FileInlineError(413, f"file too large, max {MAX_FILE_BYTES} bytes", gateway_code="file_too_large")
+    if FILE_QUOTA_BYTES > 0 and storage_used() + len(data) > FILE_QUOTA_BYTES:
+        raise FileInlineError(413, f"storage quota exceeded ({FILE_QUOTA_BYTES} bytes)",
+                              gateway_code="quota_exceeded")
     ext = _ext(filename)
     if ext in ARCHIVE_EXT:
-        raise FileInlineError(415, "archives are not auto-extracted; please unpack first")
+        raise FileInlineError(415, "archives are not auto-extracted; please unpack first", gateway_code="unsupported_file")
     fid = "file_" + secrets.token_hex(16)
     tmp = os.path.join(FILES_DIR, fid + ".tmp")
     dst = os.path.join(FILES_DIR, fid)
@@ -746,9 +840,9 @@ def inline_file_block(block, walk_source=False):
         return block
     meta, data = files_blob(fid)
     if not meta:
-        raise FileInlineError(404, f"file_id not found: {fid}")
+        raise FileInlineError(404, f"file_id not found: {fid}", gateway_code="file_not_found")
     if data is None:
-        raise FileInlineError(410, f"file content missing: {fid}")
+        raise FileInlineError(410, f"file content missing: {fid}", gateway_code="file_content_missing")
     name, ctype = meta["filename"], (meta["content_type"] or "").lower()
     ext = _ext(name)
     if ctype.startswith("image/") or ext in IMAGE_EXT:
@@ -757,7 +851,7 @@ def inline_file_block(block, walk_source=False):
                 "source": {"type": "base64", "media_type": media,
                            "data": base64.b64encode(data).decode("ascii")}}
     if ext in ARCHIVE_EXT:
-        raise FileInlineError(415, f"archive not supported inline: {name}")
+        raise FileInlineError(415, f"archive not supported inline: {name}", gateway_code="unsupported_file")
     text = None
     try:
         if ext in TEXT_EXT or ctype.startswith("text/") or ctype in ("application/json", "application/xml"):
@@ -772,7 +866,7 @@ def inline_file_block(block, walk_source=False):
     if text:
         return _text_block(name, text)
     # 未知二进制：明确报错，不静默丢弃
-    raise FileInlineError(415, f"unsupported or unextractable file type for inline: {name} ({ctype or ext})")
+    raise FileInlineError(415, f"unsupported or unextractable file type for inline: {name} ({ctype or ext})", gateway_code="unsupported_file")
 
 
 def expand_file_refs(payload: dict):
@@ -936,7 +1030,9 @@ def upstream_roundtrip(handler, upstream_path, payload, stream, sanitized=False,
             pass
         _log("UPSTREAM UNREACHABLE:", type(exc).__name__, exc)
         try:
-            handler._json(502, {"error": {"type": "api_error", "message": f"cc-switch/upstream unreachable: {exc}"}})
+            handler._json(502, _gateway_error("ccswitch_unreachable", f"cc-switch/upstream unreachable: {exc}",
+                                  "确认 CC Switch 正在运行（内置代理 127.0.0.1:15721）且当前供应商可用；可用 diagnose.ps1 收集详情",
+                                  "api_error"))
         except Exception:
             pass
 
@@ -1113,17 +1209,24 @@ class EdgeHandler(BaseHTTPRequestHandler):
         query = urllib.parse.parse_qs(parsed.query)
         if path in ("/healthz", "/health"):
             state = read_ccswitch_state(force=True); active = state.get("active") or {}
-            return self._json(200, {"status": "ok", "edge": "office_edge", "version": VERSION,
-                                    "ccswitch_channel": state.get("channel"),
-                                    "ccswitch_proxy": CCSWITCH_BASE + state.get("prefix", ""),
-                                    "active_provider": active.get("name"),
-                                    "upstream_base_url": active.get("env", {}).get("ANTHROPIC_BASE_URL"),
-                                    "api_format": active.get("api_format"),
-                                    "model_routes": active.get("routes")})
+            payload = {"status": "ok", "edge": "office_edge", "version": VERSION,
+                       "ccswitch_channel": state.get("channel"),
+                       "ccswitch_proxy": CCSWITCH_BASE + state.get("prefix", ""),
+                       "active_provider": active.get("name"),
+                       "upstream_base_url": active.get("env", {}).get("ANTHROPIC_BASE_URL"),
+                       "api_format": active.get("api_format"),
+                       "model_routes": active.get("routes")}
+            if state.get("diagnosis"):
+                payload["ccswitch_diagnosis"] = state["diagnosis"]
+                payload["suggestion"] = state.get("suggestion")
+            return self._json(200, payload)
         if path == "/status/ccswitch":
             return self._json(200, read_ccswitch_state(force=True))
         if not self._check_auth(query):
-            return self._json(401, {"error": {"type": "authentication_error", "message": "invalid gateway token"}})
+            return self._json(401, _gateway_error("invalid_gateway_token", "invalid gateway token",
+                                                  "检查 Office Gateway 配置里的 Token（占位模式填 PROXY_MANAGED）；"
+                                                  "旧版 CC Switch 可在 /status/ccswitch 查看实时令牌",
+                                                  "authentication_error"))
         if path in ("/v1/models", "/models"):
             state = read_ccswitch_state(force=True)
             if state.get("model_entries"):
@@ -1172,7 +1275,10 @@ class EdgeHandler(BaseHTTPRequestHandler):
         path = parsed.path.rstrip("/") or "/"
         query = urllib.parse.parse_qs(parsed.query)
         if not self._check_auth(query):
-            return self._json(401, {"error": {"type": "authentication_error", "message": "invalid gateway token"}})
+            return self._json(401, _gateway_error("invalid_gateway_token", "invalid gateway token",
+                                                  "检查 Office Gateway 配置里的 Token（占位模式填 PROXY_MANAGED）；"
+                                                  "旧版 CC Switch 可在 /status/ccswitch 查看实时令牌",
+                                                  "authentication_error"))
         m = re.fullmatch(r"/v1/files/([A-Za-z0-9_]+)", path)
         if m:
             meta = files_delete(m.group(1))
@@ -1188,10 +1294,13 @@ class EdgeHandler(BaseHTTPRequestHandler):
         path = parsed.path.rstrip("/") or "/"
         query = urllib.parse.parse_qs(parsed.query)
         if not self._check_auth(query):
-            return self._json(401, {"error": {"type": "authentication_error", "message": "invalid gateway token"}})
+            return self._json(401, _gateway_error("invalid_gateway_token", "invalid gateway token",
+                                                  "检查 Office Gateway 配置里的 Token（占位模式填 PROXY_MANAGED）；"
+                                                  "旧版 CC Switch 可在 /status/ccswitch 查看实时令牌",
+                                                  "authentication_error"))
         length = int(self.headers.get("Content-Length", 0) or 0)
         if length > MAX_BODY:
-            return self._json(413, {"error": {"message": "body too large"}})
+            return self._json(413, _gateway_error("body_too_large", "body too large", f"单请求上限 {MAX_BODY} 字节"))
         raw = self.rfile.read(length) if length else b""
 
         # Files 上传：multipart/form-data
@@ -1204,7 +1313,7 @@ class EdgeHandler(BaseHTTPRequestHandler):
         try:
             payload = json.loads(raw.decode("utf-8")) if raw else {}
         except Exception:
-            return self._json(400, {"error": {"message": "invalid JSON body"}})
+            return self._json(400, _gateway_error("invalid_json", "invalid JSON body", "请求体必须是合法的 JSON 对象"))
         state = read_ccswitch_state()
         provider = (state.get("active") or {}).get("name")
 
@@ -1216,7 +1325,7 @@ class EdgeHandler(BaseHTTPRequestHandler):
                 payload = normalize_payload(payload)
                 payload = expand_file_refs(payload)
             except FileInlineError as e:
-                return self._json(e.code, {"error": {"type": "invalid_request_error", "message": e.message}})
+                return self._json(e.code, _file_error(e))
             if LOG_SHAPE:
                 _log("request shape:", _shape_summary(payload))
             original_payload = payload  # 记忆预清洗前的透明报文，用于差异记忆
@@ -1276,7 +1385,7 @@ class EdgeHandler(BaseHTTPRequestHandler):
         try:
             meta = files_create(filename or "upload", fct, data, purpose, exp)
         except FileInlineError as e:
-            return self._json(e.code, {"error": {"type": "invalid_request_error", "message": e.message}})
+            return self._json(e.code, _file_error(e))
         self._json(200, meta)
 
     def _openai_nonstream(self, ant, req_model):
@@ -1303,7 +1412,11 @@ def main():
     files_db().close()
     state = read_ccswitch_state(force=True)
     if state.get("error"):
-        _log("WARN read cc-switch db:", state["error"])
+        _log("WARN read cc-switch db:", state["error"], "|", state.get("suggestion", ""))
+    missing = verify_files_integrity()
+    if missing > 0:
+        _log(f"WARN: {missing} file records lack content objects (data dir partially copied/moved?)")
+    start_background_maintenance()
     _log("channel =", state.get("channel") or "(none)", "| CC Switch proxy =", CCSWITCH_BASE + state.get("prefix", ""))
     _log("active provider =", (state.get("active") or {}).get("name"))
     srv = Server((EDGE_HOST, EDGE_PORT), EdgeHandler)

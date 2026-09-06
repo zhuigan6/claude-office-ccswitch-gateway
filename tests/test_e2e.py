@@ -291,5 +291,13 @@ class TestEndToEnd(unittest.TestCase):
         self.assertNotIn("metadata", MockCCSwitch.last_payload)
 
 
+    def test_06_auth_error_carries_code(self):
+        status, body = self._req("GET", "/v1/files", headers={"x-api-key": "definitely-wrong"})
+        self.assertEqual(status, 401)
+        err = json.loads(body)["error"]
+        self.assertEqual(err.get("code"), "invalid_gateway_token")
+        self.assertIn("suggestion", err)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

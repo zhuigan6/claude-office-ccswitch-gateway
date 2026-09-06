@@ -52,21 +52,18 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1
 
 ## 升级
 
-升级 = 只换代码，不动配置与数据：
+升级 = 只换代码，不动配置与数据（`.env` 与 `runtime\` 自动保留）：
 
 ```powershell
-# 1. 停网关（守护进程会拦着自动重启，所以先停守护）
-Get-CimInstance Win32_Process -Filter "Name like 'python%'" |
-  Where-Object { $_.CommandLine -like "*ClaudeOfficeGateway*" } |
-  ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
-
-# 2. 覆盖 gateway\office_edge.py、supervisor.py（git pull 或下载新版覆盖）
-#    .env 与 runtime\ 不要动
-
-# 3. 重启
-Start-Process -FilePath "<pythonw路径>" -ArgumentList '"C:\Tools\ClaudeOfficeGateway\supervisor.py"'
+# 一步式（推荐）：进入安装目录
+git pull                      # git 安装方式
+powershell -ExecutionPolicy Bypass -File .\install.ps1   # 自动停旧进程 -> 换代码 -> 重启 -> 等健康
 .\verify.ps1
+
+# Release zip 安装方式：下载新版 zip 解压覆盖（.env 与 runtime\ 别动），再重跑 install.ps1
 ```
+
+`install.ps1` 会自动停掉本目录的旧网关/守护进程并迁移，无需手动清理。`diagnose.ps1` 会提示是否有新版本。
 
 破坏性变更（端口/令牌/配置格式）会在 [CHANGELOG](../CHANGELOG.md) 中以 MAJOR 版本显著标注并给迁移说明。
 
