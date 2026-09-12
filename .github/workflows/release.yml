@@ -11,8 +11,21 @@ jobs:
   build-release:
     # 打 tag 即自动发布：仓库 + 官方嵌入式 Python 运行时 打成 zip（用户零 Python 安装）
     runs-on: windows-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Validate release version
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $version = $env:GITHUB_REF_NAME -replace '^v', ''
+          if ($version -notmatch '^\d+\.\d+\.\d+$') { throw 'Expected a stable vX.Y.Z tag' }
+          $source = Get-Content gateway/office_edge.py -Raw
+          if ($source -notmatch ('(?m)^VERSION = "' + [regex]::Escape($version) + '"\r?$')) { throw 'Tag and gateway version differ' }
+          if (-not (Select-String -Path CHANGELOG.md -Pattern ('^## \[' + [regex]::Escape($version) + '\]'))) { throw 'Missing changelog section' }
 
       - name: Assemble bundle (repo + embeddable Python)
         shell: pwsh
@@ -21,14 +34,32 @@ jobs:
           $tag = $env:GITHUB_REF_NAME
           New-Item -ItemType Directory -Path dist | Out-Null
           git archive --format=zip -o dist\src.zip HEAD
+          if ($LASTEXITCODE -ne 0) { throw 'Source archive failed' }
           Expand-Archive dist\src.zip -DestinationPath dist\bundle
           Remove-Item dist\src.zip
-          $pyver = "3.11.9"
+          $pyver = "3.13.15"
           Invoke-WebRequest "https://www.python.org/ftp/python/$pyver/python-$pyver-embed-amd64.zip" -OutFile dist\py.zip
+          $expected = "d1f04d990aee1253d8569e8e5104e30fa9f5fa830899f14843448872d936a2cf"
+          if ((Get-FileHash dist\py.zip -Algorithm SHA256).Hash -ne $expected) { throw 'Python runtime checksum mismatch' }
           Expand-Archive dist\py.zip -DestinationPath dist\bundle\_python
           Remove-Item dist\py.zip
           Compress-Archive -Path dist\bundle\* -DestinationPath "dist\ClaudeOfficeGateway-$tag-windows-x64.zip"
           Get-ChildItem dist | Select-Object Name, Length
+
+      - name: Test the actual download bundle
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          Expand-Archive "dist\ClaudeOfficeGateway-$env:GITHUB_REF_NAME-windows-x64.zip" -DestinationPath dist\verify
+          Push-Location dist\verify
+          try {
+            foreach ($file in @('.env.example', 'install.bat', 'install.ps1', 'templates/claude-office.xml', 'docs/UPGRADE-3.4.md', '_python/pythonw.exe')) {
+              if (-not (Test-Path -LiteralPath $file -PathType Leaf)) { throw "Missing bundle file: $file" }
+            }
+            if ((Test-Path .env) -or (Test-Path runtime)) { throw 'Private runtime data in bundle' }
+            & .\_python\python.exe -m unittest discover -s tests -v
+            if ($LASTEXITCODE -ne 0) { throw 'Bundled runtime regression tests failed' }
+          } finally { Pop-Location }
 
       - name: SHA256SUMS
         shell: pwsh
@@ -49,14 +80,16 @@ jobs:
             if ($lines[$i] -match ("^## \[" + [regex]::Escape($ver) + "\]")) { $startIdx = $i; break }
           }
           if ($null -eq $startIdx) {
-            $body = @("Release $env:GITHUB_REF_NAME", "", "（CHANGELOG 中未找到 $ver 小节，请查看完整 CHANGELOG.md）")
+            throw "CHANGELOG section missing: $ver"
           } else {
             $body = @($lines[$startIdx..($lines.Count - 1)])
             for ($i = 1; $i -lt $body.Count; $i++) {
               if ($body[$i] -match "^## \[") { $body = @($body[0..($i - 2)]); break }
             }
           }
-          $body -join "`r`n" | Out-File -Encoding utf8 dist\release-notes.md
+          $notes = ($body -join "`r`n").Replace('(docs/UPGRADE-3.4.md)', "(https://github.com/$env:GITHUB_REPOSITORY/blob/$env:GITHUB_REF_NAME/docs/UPGRADE-3.4.md)")
+          $notes += "`r`n`r`nWindows x64: download the named ZIP below (includes Python 3.13.15); Source code archives do not include Python. Verify it with SHA256SUMS.txt. Existing users: back up first and retain your .env, runtime folder, port, scheduled task and Office history; do not reset or reinstall over your data.`r`n"
+          $notes | Out-File -Encoding utf8 dist\release-notes.md
           Get-Content dist\release-notes.md
 
       - name: Create GitHub release
@@ -64,4 +97,5 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         shell: pwsh
         run: |
-          gh release create "$env:GITHUB_REF_NAME" dist\*.zip dist\SHA256SUMS.txt --notes-file dist\release-notes.md --title "$env:GITHUB_REF_NAME"
+          gh release create "$env:GITHUB_REF_NAME" dist\*.zip dist\SHA256SUMS.txt --verify-tag --latest --notes-file dist\release-notes.md --title "$env:GITHUB_REF_NAME"
+          if ($LASTEXITCODE -ne 0) { throw 'Release publication failed' }

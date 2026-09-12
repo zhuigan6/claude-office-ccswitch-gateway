@@ -24,6 +24,7 @@
 ## 后果
 
 - 嵌入式运行时无 pip：`-WithExtras`（PDF/Office 增强解析）在自带运行时下不可用，install.ps1 会给出明确警告并退回标准库解析（增强解析本就是可选增强）；
-- `_python\` 目录被 gitignore，不入库；发布包由 CI 从 python.org 固定版本（3.11.9）拉取，可复现；
+- `_python\` 目录被 gitignore，不入库；发布包与无 Python 时的安装兜底从 python.org 固定版本（3.13.15）拉取，并核对官方 SHA-256；版本与摘要来自 [Python 官方发布页](https://www.python.org/downloads/release/python-31315/)；
+- 发布前解压实际 ZIP，用包内运行时执行回归测试；不执行安装脚本，不注册任务，不触及用户数据；
 - 发布包仅含 Windows x64 嵌入式运行时；系统 Python 路径仍对 ARM/macOS 开放；
-- 升级语义：替换目录后重跑 `install.bat` 即可，`.env` 与 `runtime\` 数据保留。
+- 升级时先备份，保留 `.env`、`runtime\`、现有端口、自启任务和 Office 数据，仅替换程序文件并重启已确认归属的进程；不要删除整个安装目录。已有安装按 [3.4 升级说明](../UPGRADE-3.4.md) 操作，无需重新注册自启任务。

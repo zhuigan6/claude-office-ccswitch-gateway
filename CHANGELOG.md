@@ -5,6 +5,10 @@
 
 ## [3.4.0] - 2026-09-12
 
+### Distribution
+- Update the bundled Windows x64 Python runtime and no-Python installer fallback to 3.13.15, verified against the official SHA-256.
+- Validate tag/version/changelog consistency and run regressions using the actual download bundle before publication; publish checksum and preservation-first upgrade guidance.
+
 ### Fixed
 - Repair developer manifest generation: restore the historical three-host shared-runtime template, load the official frontend, encode gateway/token parameters and back up an existing output before replacement.
 - Retain historical deep-sanitization as an explicit `EDGE_LEGACY_SANITIZE=1` opt-in, disabled by default and never learned across models (ADR-0009).

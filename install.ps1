@@ -72,13 +72,17 @@ if (Test-Path -LiteralPath $bundled) {
     }
     if (-not $python) {
         # 自动下载官方嵌入式 Python（PSF 许可证允许再分发；解压到 _python\，不写系统、不需要管理员）
-        $pyver = "3.11.9"
+        $pyver = "3.13.15"
         $url = "https://www.python.org/ftp/python/$pyver/python-$pyver-embed-amd64.zip"
         Write-Host "[1/5] 未检测到系统 Python，正在下载官方嵌入式运行时（约 11MB，仅本项目使用）..."
         try {
             [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
             $zipPath = Join-Path $root "_python-download.zip"
             Invoke-WebRequest -Uri $url -OutFile $zipPath -UseBasicParsing
+            $expected = "d1f04d990aee1253d8569e8e5104e30fa9f5fa830899f14843448872d936a2cf"
+            if ((Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash -ne $expected) {
+                throw "Python runtime checksum mismatch"
+            }
             $pyDir = Join-Path $root "_python"
             if (Test-Path -LiteralPath $pyDir) { Remove-Item -LiteralPath $pyDir -Recurse -Force }
             Expand-Archive -LiteralPath $zipPath -DestinationPath $pyDir -Force
