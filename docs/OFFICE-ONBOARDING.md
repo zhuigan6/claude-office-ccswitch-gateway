@@ -17,8 +17,12 @@ Word、Excel、PowerPoint 三个软件共用这一套配置。填完发一条消
 
 **Token 说明**：
 - 新版 CC Switch（claude 通道）：`PROXY_MANAGED` 直接可用；
-- 旧版 CC Switch（claude-desktop 通道）：数据库带有实时网关令牌，网关会强制校验——若发消息报 401，浏览器打开 `http://127.0.0.1:8790/status/ccswitch`，把返回 JSON 里 `token` 字段的值填进 Office 的 Token 框；
+- 旧版 CC Switch（claude-desktop 通道）：未设置 `EDGE_TOKEN` 时也填 `PROXY_MANAGED`；数据库中的实时令牌仅在网关内部用于上游请求，状态接口不再提供令牌；
 - 想更进一步收紧（多人共机）：在 `.env` 设 `EDGE_TOKEN=你的秘密值`，Office 填这个值，错误令牌一律 401。
+
+两个通道同时存在时，`auto` 仍优先 `claude-desktop`。若你希望跟随 Claude Code 分类，请显式配置 `CCSWITCH_CHANNEL=claude`。升级保留原端口及 Office 登录数据；无需重新旁加载。
+
+默认只接受 `https://pivot.claude.ai` 的跨域请求。自建前端需在 `EDGE_ALLOWED_ORIGINS` 中配置精确 Origin（逗号分隔），不支持通配 `*`。
 
 ## 方式 B：开发者旁加载清单（老版加载项没有配置界面时）
 

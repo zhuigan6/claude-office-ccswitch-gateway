@@ -69,7 +69,7 @@ class TestToolsCompat(unittest.TestCase):
              "tool_choice": {"type": "tool", "name": "f"}}
         out = office_edge.normalize_payload(p)
         self.assertEqual(out["model"], "claude-opus-5")
-        self.assertEqual(out["tool_choice"], {"type": "auto"})
+        self.assertEqual(out["tool_choice"], {"type": "tool", "name": "f"})
         self.assertEqual(out["tools"], [])
 
 
@@ -172,6 +172,16 @@ class TestFilesLifecycle(unittest.TestCase):
         finally:
             office_edge.MAX_FILE_BYTES = old
 
+    def test_filename_is_safe_for_response_headers(self):
+        meta = office_edge.files_create('../bad"\r\nHeader: value.txt', "text/plain", b"x", "user_message", 60)
+        try:
+            self.assertNotIn("\r", meta["filename"])
+            self.assertNotIn("\n", meta["filename"])
+            self.assertNotIn('"', meta["filename"])
+            self.assertNotIn("/", meta["filename"])
+        finally:
+            office_edge.files_delete(meta["id"])
+
 
 class TestExtraction(unittest.TestCase):
     def test_extract_docx_stdlib(self):
@@ -234,9 +244,9 @@ class TestCCSwitchState(unittest.TestCase):
         # 回归：旧版库里 'claude' 是 Claude Code（编辑器）分类，必须优先识别 claude-desktop
         db = os.path.join(tempfile.gettempdir(), "cc-switch-test-%d.db" % os.getpid())
         self._make_db(db)
-        old_db, old_ch = office_edge.CCSWITCH_DB, os.environ.get("CCSWITCH_CHANNEL")
+        old_db, old_ch = office_edge.CCSWITCH_DB, office_edge.CCSWITCH_CHANNEL
         office_edge.CCSWITCH_DB = db
-        os.environ["CCSWITCH_CHANNEL"] = "auto"
+        office_edge.CCSWITCH_CHANNEL = "auto"
         try:
             state = office_edge.read_ccswitch_state(force=True)
             self.assertEqual(state["channel"], "claude-desktop")
@@ -247,10 +257,7 @@ class TestCCSwitchState(unittest.TestCase):
                              [("claude-sonnet-5", "claude-sonnet-5", "deepseek-v4-flash")])
         finally:
             office_edge.CCSWITCH_DB = old_db
-            if old_ch is None:
-                os.environ.pop("CCSWITCH_CHANNEL", None)
-            else:
-                os.environ["CCSWITCH_CHANNEL"] = old_ch
+            office_edge.CCSWITCH_CHANNEL = old_ch
             os.remove(db)
             office_edge.read_ccswitch_state(force=True)  # 还原缓存
 
@@ -264,6 +271,41 @@ class TestCCSwitchState(unittest.TestCase):
         finally:
             office_edge.CCSWITCH_DB = old
             office_edge.read_ccswitch_state(force=True)  # 还原缓存
+
+    def test_public_state_does_not_expose_token_or_provider_env(self):
+        state = {
+            "token": "secret-gateway-token",
+            "channel": "claude-desktop",
+            "prefix": "/claude-desktop",
+            "proxy_base": "http://127.0.0.1:15721",
+            "active": {
+                "name": "Provider",
+                "api_format": "anthropic",
+                "env": {"ANTHROPIC_AUTH_TOKEN": "secret-provider-token"},
+            },
+            "model_entries": [("claude-sonnet-5", "claude-sonnet-5", "model-x")],
+        }
+        public = office_edge.public_ccswitch_state(state)
+        encoded = json.dumps(public)
+        self.assertNotIn("secret-gateway-token", encoded)
+        self.assertNotIn("secret-provider-token", encoded)
+        self.assertNotIn("env", public)
+        self.assertTrue(public["gateway_token_configured"])
+
+    def test_expand_path_supports_windows_percent_variables(self):
+        if os.name != "nt":
+            self.skipTest("percent expansion is Windows-specific")
+        old = os.environ.get("OFFICE_EDGE_TEST_ROOT")
+        os.environ["OFFICE_EDGE_TEST_ROOT"] = tempfile.gettempdir()
+        try:
+            expanded = office_edge._expand_path(r"%OFFICE_EDGE_TEST_ROOT%\cc-switch.db")
+            self.assertNotIn("%OFFICE_EDGE_TEST_ROOT%", expanded)
+            self.assertTrue(expanded.endswith("cc-switch.db"))
+        finally:
+            if old is None:
+                os.environ.pop("OFFICE_EDGE_TEST_ROOT", None)
+            else:
+                os.environ["OFFICE_EDGE_TEST_ROOT"] = old
 
 
 class TestExperienceFidelity(unittest.TestCase):
@@ -320,6 +362,13 @@ class TestExperienceFidelity(unittest.TestCase):
         out = json.loads(office_edge._ensure_anthropic_error(502, b"<html>bad gateway</html>"))
         self.assertEqual(out["type"], "error")
         self.assertIn("bad gateway", out["error"]["message"])
+
+    def test_persisted_error_redacts_credentials(self):
+        raw = b'{"api_key":"sk-secretvalue123","authorization":"Bearer abcdefghijklmnop"}'
+        redacted = office_edge._redact_error_bytes(raw).decode()
+        self.assertNotIn("secretvalue123", redacted)
+        self.assertNotIn("abcdefghijklmnop", redacted)
+        self.assertIn("REDACTED", redacted)
 
     def test_files_default_ttl_24h(self):
         meta = office_edge.files_create("ttl.txt", "text/plain", b"x", "user_message", None)

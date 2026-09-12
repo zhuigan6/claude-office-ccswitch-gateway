@@ -9,6 +9,7 @@ test_e2e.py —— 端到端测试：真实起网关子进程 + mock CC Switch �
   4. Files 上传 -> file_id 内联为文本块后转发
 """
 import http.server
+import http.client
 import json
 import os
 import socket
@@ -40,13 +41,21 @@ class MockCCSwitch(http.server.BaseHTTPRequestHandler):
     """模拟旧版 CC Switch 代理（claude-desktop 通道）。"""
     request_count = 0
     last_payload = None
+    last_headers = None
+    release_stream = threading.Event()
     protocol_version = "HTTP/1.1"
 
     def log_message(self, *a):
         pass
 
     def do_POST(self):
-        if not self.path.endswith("/v1/messages"):
+        if self.path.endswith("/v1/messages/count_tokens"):
+            payload = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            MockCCSwitch.last_payload = payload
+            MockCCSwitch.last_headers = dict(self.headers)
+            body = b'{"input_tokens":7}'
+            self.send_response(200)
+        elif not self.path.endswith("/v1/messages"):
             body = b'{"error":"not found"}'
             self.send_response(404)
         else:
@@ -54,7 +63,11 @@ class MockCCSwitch(http.server.BaseHTTPRequestHandler):
             payload = json.loads(self.rfile.read(length).decode("utf-8"))
             MockCCSwitch.request_count += 1
             MockCCSwitch.last_payload = payload
-            if "metadata" in payload:  # 模拟 DeepSeek 类上游拒绝该字段
+            MockCCSwitch.last_headers = dict(self.headers)
+            if payload.get("model") == "fail-502":
+                body = b'{"message":"metadata not allowed"}'
+                self.send_response(502)
+            elif "metadata" in payload:  # 模拟 DeepSeek 类上游拒绝该字段
                 body = json.dumps({"type": "error",
                                    "error": {"message": "extra field metadata not allowed"}}).encode()
                 self.send_response(400)
@@ -76,6 +89,8 @@ class MockCCSwitch(http.server.BaseHTTPRequestHandler):
                     try:
                         self.wfile.write(ev)
                         self.wfile.flush()
+                        if payload.get("model") == "delayed-stream" and ev is events[0]:
+                            MockCCSwitch.release_stream.wait(5)
                     except (BrokenPipeError, ConnectionError):
                         return
                 return
@@ -228,6 +243,11 @@ class TestEndToEnd(unittest.TestCase):
         self.assertEqual(status, 200)
         models = json.loads(body)["data"]
         self.assertTrue(models and all("claude" in m["id"] for m in models))
+        status, body = self._req("GET", "/status/ccswitch")
+        self.assertEqual(status, 200)
+        public_state = json.loads(body)
+        self.assertNotIn("token", public_state)
+        self.assertNotIn("active", public_state)
 
     def test_02_non_stream_with_sanitize_retry(self):
         MockCCSwitch.request_count = 0
@@ -297,6 +317,82 @@ class TestEndToEnd(unittest.TestCase):
         err = json.loads(body)["error"]
         self.assertEqual(err.get("code"), "invalid_gateway_token")
         self.assertIn("suggestion", err)
+
+    def test_07_cors_rejects_untrusted_origin(self):
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{self.gateway_port}/v1/messages",
+            method="OPTIONS",
+            headers={
+                "Origin": "https://untrusted.example",
+                "Access-Control-Request-Method": "POST",
+            },
+        )
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            opener.open(request, timeout=10)
+        self.assertEqual(caught.exception.code, 403)
+        self.assertIsNone(caught.exception.headers.get("Access-Control-Allow-Origin"))
+
+    def test_08_rejects_non_object_json_and_simple_cross_origin_posts(self):
+        for payload in ([], None, "text", 1):
+            status, _ = self._req("POST", "/v1/messages", body=json.dumps(payload).encode(), headers=self._auth())
+            self.assertEqual(status, 400)
+        status, _ = self._req("POST", "/v1/messages", body=b'{}',
+                             headers=self._auth({"Origin": "https://untrusted.example"}))
+        self.assertEqual(status, 403)
+
+    def test_09_does_not_retry_server_errors(self):
+        MockCCSwitch.request_count = 0
+        status, _ = self._req("POST", "/v1/messages", headers=self._auth(),
+                             body=json.dumps({"model": "fail-502", "metadata": {}, "messages": []}).encode())
+        self.assertEqual(status, 502)
+        self.assertEqual(MockCCSwitch.request_count, 1)
+
+    def test_10_retry_preserves_thinking_and_tools(self):
+        payload = {"model": "new-model", "metadata": {}, "thinking": {"type": "enabled"},
+                   "tools": [{"name": "run", "input_schema": {}, "strict": True}],
+                   "tool_choice": {"type": "tool", "name": "run"},
+                   "messages": [{"role": "user", "content": "hello"}]}
+        status, _ = self._req("POST", "/v1/messages", headers=self._auth(), body=json.dumps(payload).encode())
+        self.assertEqual(status, 200)
+        self.assertEqual(MockCCSwitch.last_payload["thinking"], payload["thinking"])
+        self.assertEqual(MockCCSwitch.last_payload["tools"], payload["tools"])
+        self.assertEqual(MockCCSwitch.last_payload["tool_choice"], payload["tool_choice"])
+
+    def test_11_first_sse_event_arrives_before_upstream_finishes(self):
+        MockCCSwitch.release_stream.clear()
+        conn = http.client.HTTPConnection("127.0.0.1", self.gateway_port, timeout=2)
+        try:
+            conn.request("POST", "/v1/messages", headers=self._auth(),
+                         body=json.dumps({"model": "delayed-stream", "stream": True, "messages": []}).encode())
+            response = conn.getresponse()
+            self.assertEqual(response.status, 200)
+            self.assertEqual(response.readline(), b"event: message_start\n")
+        finally:
+            MockCCSwitch.release_stream.set()
+            conn.close()
+
+    def test_12_count_tokens_routes_alias_and_preserves_beta_headers(self):
+        status, body = self._req("POST", "/v1/messages/count_tokens", headers=self._auth({"anthropic-beta": "test-beta"}),
+                                 body=json.dumps({"model": "claude-sonnet-5--ccswitch--mock", "messages": []}).encode())
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["input_tokens"], 7)
+        self.assertEqual(MockCCSwitch.last_payload["model"], "claude-sonnet-5")
+        self.assertEqual(MockCCSwitch.last_headers["anthropic-beta"], "test-beta")
+
+    def test_13_unicode_filename_download(self):
+        boundary = "unicode-file"
+        mp = (f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="\u6d4b\u8bd5.txt"\r\n'
+              f'Content-Type: text/plain\r\n\r\nhello\r\n--{boundary}--\r\n').encode()
+        status, body = self._req("POST", "/v1/files", headers=self._auth({"Content-Type": f"multipart/form-data; boundary={boundary}"}), body=mp)
+        self.assertEqual(status, 200)
+        fid = json.loads(body)["id"]
+        try:
+            status, body = self._req("GET", f"/v1/files/{fid}/content", headers=self._auth())
+            self.assertEqual(status, 200)
+            self.assertEqual(body, b"hello")
+        finally:
+            self._req("DELETE", f"/v1/files/{fid}", headers=self._auth())
 
 
 if __name__ == "__main__":

@@ -17,6 +17,7 @@ import subprocess
 import sys
 import time
 import urllib.request
+from ctypes import wintypes
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 GATEWAY = os.path.join(HERE, "gateway", "office_edge.py")
@@ -41,7 +42,13 @@ def _load_env_file(path=None):
 
 _load_env_file()
 
-DATA_DIR = os.path.abspath(os.getenv("EDGE_DATA_DIR") or os.path.join(HERE, "runtime"))
+
+def _expand_path(value: str) -> str:
+    value = os.path.expandvars(os.path.expanduser(value))
+    return os.path.abspath(value if os.path.isabs(value) else os.path.join(HERE, value))
+
+
+DATA_DIR = _expand_path(os.getenv("EDGE_DATA_DIR") or os.path.join(HERE, "runtime"))
 PORT = int(os.getenv("EDGE_PORT", "8790"))
 HEALTH_URL = f"http://127.0.0.1:{PORT}/healthz"
 CHECK_INTERVAL = 5
@@ -52,7 +59,22 @@ CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
 def _log(*a):
-    print("[supervisor]", time.strftime("%H:%M:%S"), *a, flush=True)
+    line = "[supervisor] %s %s" % (time.strftime("%H:%M:%S"), " ".join(str(item) for item in a))
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        path = os.path.join(DATA_DIR, "supervisor.log")
+        if os.path.exists(path) and os.path.getsize(path) > 2 * 1024 * 1024:
+            os.replace(path, path + ".1")
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+    except OSError:
+        pass
+    stream = getattr(sys, "stdout", None)
+    if stream is not None:
+        try:
+            print(line, file=stream, flush=True)
+        except (OSError, ValueError):
+            pass
 
 
 def _pid_alive(pid: int) -> bool:
@@ -62,11 +84,18 @@ def _pid_alive(pid: int) -> bool:
     if os.name == "nt":
         try:
             k32 = ctypes.windll.kernel32
+            k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+            k32.OpenProcess.restype = wintypes.HANDLE
+            k32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+            k32.CloseHandle.argtypes = [wintypes.HANDLE]
             handle = k32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
             if not handle:
                 return False
-            k32.CloseHandle(handle)
-            return True
+            try:
+                status = wintypes.DWORD()
+                return bool(k32.GetExitCodeProcess(handle, ctypes.byref(status))) and status.value == 259
+            finally:
+                k32.CloseHandle(handle)
         except Exception:
             return False
     try:
@@ -123,7 +152,7 @@ def listener_pids() -> set:
     result = subprocess.run(
         ["netstat", "-ano", "-p", "tcp"],
         capture_output=True, text=True, errors="replace",
-        creationflags=CREATE_NO_WINDOW, check=False,
+        creationflags=CREATE_NO_WINDOW, check=False, timeout=5,
     )
     suffix = f":{PORT}"
     pids = set()
@@ -139,19 +168,20 @@ def listener_pids() -> set:
 
 
 def stop_stale_listeners():
-    for pid in listener_pids():
-        _log(f"killing stale listener pid={pid}")
-        subprocess.run(
-            ["taskkill", "/PID", str(pid), "/T", "/F"],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            creationflags=CREATE_NO_WINDOW, check=False,
-        )
+    # A port number does not establish process ownership. Never kill another listener.
+    try:
+        occupied = listener_pids()
+    except (OSError, subprocess.TimeoutExpired):
+        _log("listener check failed; postponing restart")
+        return False
+    if occupied:
+        _log("port is occupied; leaving existing listeners untouched:", sorted(occupied))
+        return False
+    return True
 
 
 def start_gateway():
     os.makedirs(DATA_DIR, exist_ok=True)
-    out = open(os.path.join(DATA_DIR, "edge-sup.out"), "ab", buffering=0)
-    err = open(os.path.join(DATA_DIR, "edge-sup.err"), "ab", buffering=0)
     exe = sys.executable
     if os.name == "nt" and exe.lower().endswith("python.exe"):
         pythonw = exe[:-10] + "pythonw.exe"  # 无窗口运行
@@ -159,12 +189,24 @@ def start_gateway():
             exe = pythonw
     env = os.environ.copy()
     env.setdefault("EDGE_DATA_DIR", DATA_DIR)
-    return subprocess.Popen(
-        [exe, GATEWAY],
-        cwd=HERE, env=env, stdin=subprocess.DEVNULL,
-        stdout=out, stderr=err,
-        creationflags=CREATE_NO_WINDOW,
-    )
+    with open(os.path.join(DATA_DIR, "edge-sup.out"), "ab", buffering=0) as out, \
+            open(os.path.join(DATA_DIR, "edge-sup.err"), "ab", buffering=0) as err:
+        return subprocess.Popen(
+            [exe, GATEWAY],
+            cwd=HERE, env=env, stdin=subprocess.DEVNULL,
+            stdout=out, stderr=err,
+            creationflags=CREATE_NO_WINDOW,
+        )
+
+
+def stop_child(child):
+    if child is not None and child.poll() is None:
+        child.terminate()
+        try:
+            child.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            child.kill()
+            child.wait(timeout=5)
 
 
 def main():
@@ -180,7 +222,9 @@ def main():
                 time.sleep(CHECK_INTERVAL)
                 continue
             if child is None:
-                stop_stale_listeners()
+                if not stop_stale_listeners():
+                    time.sleep(CHECK_INTERVAL)
+                    continue
                 child = start_gateway()
                 _log(f"gateway started pid={child.pid}")
                 time.sleep(5)
@@ -190,13 +234,10 @@ def main():
                 time.sleep(CHECK_INTERVAL)
                 continue
             _log(f"health check failed {failures} times, restarting gateway")
-            if child.poll() is None:
-                child.terminate()
-                try:
-                    child.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    child.kill()
-            stop_stale_listeners()
+            stop_child(child)
+            if not stop_stale_listeners():
+                time.sleep(CHECK_INTERVAL)
+                continue
             child = start_gateway()
             _log(f"gateway restarted pid={child.pid}")
             failures = 0
@@ -205,6 +246,7 @@ def main():
         _log("supervisor stopped by user")
         return 0
     finally:
+        stop_child(child)
         try:
             os.remove(LOCK_FILE)
         except OSError:

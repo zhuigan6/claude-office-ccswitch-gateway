@@ -75,20 +75,8 @@ def main() -> int:
     require(health.get("status") == "ok", "healthz payload not ok")
     print(f"PASS healthz version={health.get('version')} channel={health.get('ccswitch_channel')} provider={health.get('active_provider')}")
 
-    # 2. 模型列表（claude 别名，防被 Office 过滤）；401 时自动读取本机实时令牌重试
+    # 2. 模型列表（claude 别名，防被 Office 过滤）
     status, _, body = req(client, "GET", f"{base}/v1/models", headers=h)
-    if status == 401:
-        st, _, sb = req(client, "GET", f"{base}/status/ccswitch")
-        live = ""
-        if st == 200:
-            try:
-                live = json.loads(sb).get("token") or ""
-            except ValueError:
-                live = ""
-        if live:
-            h["x-api-key"] = live
-            print("NOTE 旧版 CC Switch（claude-desktop 通道）强制令牌校验，已从 /status/ccswitch 读取本机实时令牌")
-            status, _, body = req(client, "GET", f"{base}/v1/models", headers=h)
     require(status == 200, f"models status={status} body={body[:200]!r}")
     models = json.loads(body).get("data", [])
     require(len(models) >= 1, "model list is empty")
@@ -105,6 +93,14 @@ def main() -> int:
     require(headers.get("Access-Control-Allow-Origin") == "https://pivot.claude.ai", "CORS origin mismatch")
     require(str(headers.get("Access-Control-Allow-Private-Network", "")).lower() == "true", "PNA header missing")
     ok("cors+pna preflight")
+
+    status, headers, _ = req(client, "OPTIONS", f"{base}/v1/messages", headers={
+        "Origin": "https://untrusted.example",
+        "Access-Control-Request-Method": "POST",
+    })
+    require(status == 403, f"untrusted CORS status={status}")
+    require("Access-Control-Allow-Origin" not in headers, "untrusted origin was allowed")
+    ok("cors rejects untrusted origin")
 
     # 4. 错误令牌 -> 401（仅在网关配置了令牌时有意义；占位模式下跳过）
     status, _, _ = req(client, "GET", f"{base}/v1/files", headers={"x-api-key": "definitely-wrong-token"})
@@ -170,7 +166,8 @@ def main() -> int:
         status, _, body = req(client, "POST", f"{base}/v1/messages", headers=h,
                               data=json.dumps(payload).encode("utf-8"), timeout=120)
         require(status == 200, f"inference status={status} body={body[:500]!r}")
-        require(isinstance(json.loads(body), dict), "inference response not json object")
+        result = json.loads(body)
+        require(result.get("type") == "message" and bool(result.get("content")), "not a completed model response")
         ok("inference non-stream")
 
         payload["stream"] = True
@@ -188,8 +185,10 @@ def main() -> int:
         for line in buf.split(b"\n"):
             line = line.strip()
             if line.startswith(b"data: ") and line[6:] not in (b"[DONE]", b""):
-                json.loads(line[6:])
+                event = json.loads(line[6:])
+                require(event.get("type") != "error", "upstream SSE error event")
                 events += 1
+        require(b'"message_stop"' in buf, "stream did not complete with message_stop")
         conn.close()
         require(events > 0, "stream returned no data events")
         ok(f"inference stream events={events}")

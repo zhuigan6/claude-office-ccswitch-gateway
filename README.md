@@ -6,9 +6,9 @@
 
 ## 这是什么
 
-让 Word / Excel / PowerPoint 里的 **Claude 官方加载项**，通过本机一个轻量网关，使用 **CC Switch 当前选中的供应商和模型**（DeepSeek / Kimi / GLM 等 Anthropic 兼容端点均可）。在 CC Switch 里切换供应商，**下一句话立即生效**，无需重启任何东西。
+让 Word / Excel / PowerPoint 里的 **Claude 官方加载项**，通过本机一个轻量网关，使用 **CC Switch 当前选中的供应商和模型**（DeepSeek / Kimi / GLM 等 Anthropic 兼容端点均可）。网关检查数据库及 WAL 的变化，后续请求使用更新后的路由；Office 模型菜单可能需要重新打开。
 
-**纯本机运行**：网关只监听 `127.0.0.1`，不连任何第三方服务器，不保存任何供应商密钥（密钥始终由 CC Switch 托管）。
+**本机适配层**：默认只监听 `127.0.0.1`，向 CC Switch 转发请求，由 CC Switch 连接供应商。网关只读其配置，不持久化供应商密钥。
 
 ```text
 Word / Excel / PPT 的 Claude 加载项 (https://pivot.claude.ai)
@@ -22,8 +22,8 @@ CC Switch 当前供应商（GUI 一键切换，按请求热生效）
 
 ## 功能
 
-- **Anthropic Messages 全量透传**：流式/非流式、thinking、工具调用、图片、附件全部保留；仅当上游明确拒绝某字段时，自动做一次兼容清洗重试
-- **供应商指纹记忆**：某供应商拒绝过哪些字段会被记住，后续请求直接预清洗——不兼容供应商每条消息省一次注定失败的往返；兼容供应商行为完全不变（[ADR-0008](docs/adr/0008-provider-fingerprint-sanitize-memory.md)）
+- **Anthropic Messages 透传**：保留 thinking、原生工具、强制工具选择和扩展参数；仅解包 Office custom 工具外壳。上游明确以 400/422 拒绝 metadata/service_tier 时，移除对应字段重试一次。
+- **有边界的兼容记忆**：按通道、供应商、模型与配置隔离，五分钟过期；不会自动删除思考、图片、工具或系统提示。详见 [3.4 升级说明](docs/UPGRADE-3.4.md)。
 - **报错看得懂**：网关自身错误带机器可读 `code` + 可行动的 `suggestion`；上游错误归一为官方错误形状
 - **动态模型列表**：`/v1/models` 按当前供应商实时合成 `claude-*` 别名（避免被 Office 过滤），切换供应商后重开侧栏即更新
 - **Files API**：上传/列表/下载/删除（默认 24h 有效、总额配额、后台自动清理），消息引用 `file_id` 自动内联为图片或文本（TXT/MD/CSV/JSON/XML/PDF/DOCX/XLSX/PPTX），归档明确拒绝不解压（防压缩炸弹）

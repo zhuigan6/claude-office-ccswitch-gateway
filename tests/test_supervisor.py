@@ -55,6 +55,16 @@ class TestLockTakeover(unittest.TestCase):
         self.assertTrue(supervisor.acquire_lock())
         os.remove(supervisor.LOCK_FILE)
 
+    def test_log_survives_pythonw_without_stdout(self):
+        old_stdout = sys.stdout
+        sys.stdout = None
+        try:
+            supervisor._log("pythonw-safe")
+        finally:
+            sys.stdout = old_stdout
+        with open(os.path.join(self.tmp, "supervisor.log"), "r", encoding="utf-8") as fh:
+            self.assertIn("pythonw-safe", fh.read())
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

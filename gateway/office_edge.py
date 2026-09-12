@@ -31,6 +31,7 @@ office_edge.py —— Office 加载项 ⇄ CC Switch 边缘网关 v3.0（统一�
 from __future__ import annotations
 
 import base64
+import copy
 import hashlib
 import io
 import json
@@ -45,7 +46,7 @@ import urllib.parse
 import zipfile
 import zlib
 from contextlib import contextmanager
-from http.client import HTTPConnection
+from http.client import HTTPConnection, HTTPException, HTTPSConnection
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
@@ -73,7 +74,14 @@ _load_env_file()
 # --------------------------------------------------------------------------- #
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
-DATA_DIR = os.path.abspath(os.getenv("EDGE_DATA_DIR") or os.path.join(ROOT, "runtime"))
+
+
+def _expand_path(value: str) -> str:
+    value = os.path.expandvars(os.path.expanduser(value))
+    return os.path.abspath(value if os.path.isabs(value) else os.path.join(ROOT, value))
+
+
+DATA_DIR = _expand_path(os.getenv("EDGE_DATA_DIR") or os.path.join(ROOT, "runtime"))
 FILES_DIR = os.path.join(DATA_DIR, "files", "objects")
 FILES_DB = os.path.join(DATA_DIR, "files", "files.db")
 os.makedirs(FILES_DIR, exist_ok=True)
@@ -82,9 +90,14 @@ EDGE_HOST = os.getenv("EDGE_HOST", "127.0.0.1")
 EDGE_PORT = int(os.getenv("EDGE_PORT", "8790"))
 CCSWITCH_BASE = os.getenv("CCSWITCH_BASE", "http://127.0.0.1:15721").rstrip("/")
 CCSWITCH_CHANNEL = os.getenv("CCSWITCH_CHANNEL", "auto").strip().lower()
-CCSWITCH_DB = os.getenv(
+CCSWITCH_DB = _expand_path(os.getenv(
     "CCSWITCH_DB", os.path.join(os.path.expanduser("~"), ".cc-switch", "cc-switch.db")
-)
+))
+ALLOWED_ORIGINS = {
+    value.strip()
+    for value in os.getenv("EDGE_ALLOWED_ORIGINS", "https://pivot.claude.ai").split(",")
+    if value.strip()
+}
 DEFAULT_ANTHROPIC_MODEL = os.getenv("DEFAULT_ANTHROPIC_MODEL", "claude-sonnet-4-6")
 LOG_REDACT = os.getenv("EDGE_LOG_REDACT", "1") != "0"
 LOG_SHAPE = os.getenv("EDGE_LOG_SHAPE", "0") == "1"
@@ -95,16 +108,16 @@ FILE_QUOTA_BYTES = int(os.getenv("EDGE_FILE_QUOTA_BYTES", str(1024 * 1024 * 1024
 PRUNE_INTERVAL = int(os.getenv("EDGE_PRUNE_INTERVAL", "600"))  # 后台维护间隔（秒）
 ACCESS_LOG = os.path.join(DATA_DIR, "edge-access.log")
 ACCESS_LOG_MAX = int(os.getenv("EDGE_ACCESS_LOG_MAX", str(2 * 1024 * 1024)))
-VERSION = "3.3"
+VERSION = "3.4.0"
 
 # 到 127.0.0.1 的转发绝不走系统代理（http.client 本身不读环境代理，这里再兜底，防止 502 no body）
 for _k in ("NO_PROXY", "no_proxy"):
     os.environ[_k] = "127.0.0.1,localhost"
 
 _db_lock = threading.Lock()
-_db_mtime = 0.0
+_db_mtime = None
 _state_cache: dict = {}
-_file_lock = threading.Lock()
+_file_lock = threading.RLock()
 _MODEL_MAP: dict = {}  # picker 别名 -> 语义模型 id，用于转发前还原
 
 ARCHIVE_EXT = {".zip", ".rar", ".7z", ".tar", ".gz", ".bz2", ".xz"}
@@ -131,7 +144,8 @@ def _slot_entries_from_env(env: dict):
     )
     out = []
     for key, picker, semantic in table:
-        real = (env.get(key) or "").strip()
+        value = env.get(key)
+        real = value.strip() if isinstance(value, str) else ""
         if real:
             out.append((picker, semantic, real))
     return out
@@ -140,11 +154,17 @@ def _slot_entries_from_env(env: dict):
 def read_ccswitch_state(force: bool = False) -> dict:
     global _db_mtime, _state_cache, _MODEL_MAP
     try:
-        mtime = os.path.getmtime(CCSWITCH_DB)
+        stat = os.stat(CCSWITCH_DB)
+        try:
+            wal = os.stat(CCSWITCH_DB + "-wal")
+            wal_stamp = (wal.st_mtime_ns, wal.st_size)
+        except FileNotFoundError:
+            wal_stamp = None
+        mtime = (CCSWITCH_DB, CCSWITCH_CHANNEL, stat.st_mtime_ns, stat.st_size, wal_stamp)
     except OSError:
         return {"error": f"db not found: {CCSWITCH_DB}"}
     with _db_lock:
-        if not force and _state_cache and abs(mtime - _db_mtime) < 0.3:
+        if not force and _state_cache and not _state_cache.get("error") and mtime == _db_mtime:
             return _state_cache
         state = {"token": "", "channel": None, "prefix": "", "active": None,
                  "proxy_base": CCSWITCH_BASE}
@@ -165,6 +185,8 @@ def read_ccswitch_state(force: bool = False) -> dict:
                 env, routes, api_format = {}, {}, "anthropic"
                 try:
                     env = (json.loads(cfg) or {}).get("env", {}) or {}
+                    if not isinstance(env, dict):
+                        env = {}
                 except Exception:
                     pass
                 try:
@@ -261,9 +283,33 @@ def expected_token() -> str:
     return read_ccswitch_state().get("token", "") or os.getenv("EDGE_TOKEN", "").strip()
 
 
+def public_ccswitch_state(state: dict | None = None) -> dict:
+    """Return diagnostics without exposing provider env values or gateway tokens."""
+    state = state or read_ccswitch_state(force=True)
+    active = state.get("active") or {}
+    public = {
+        "channel": state.get("channel"),
+        "prefix": state.get("prefix", ""),
+        "proxy_base": state.get("proxy_base", CCSWITCH_BASE),
+        "gateway_token_configured": bool(state.get("token") or os.getenv("EDGE_TOKEN", "").strip()),
+        "active_provider": active.get("name"),
+        "api_format": active.get("api_format"),
+        "model_entries": state.get("model_entries") or [],
+    }
+    for key in ("diagnosis", "suggestion", "error"):
+        if state.get(key):
+            public[key] = state[key]
+    return public
+
+
 def _split_base(base: str):
     u = urllib.parse.urlparse(base)
-    return u.hostname, u.port or 80, u.scheme == "https"
+    return u.hostname, u.port or (443 if u.scheme == "https" else 80), u.scheme == "https"
+
+
+def _connection(timeout):
+    host, port, secure = _split_base(CCSWITCH_BASE)
+    return (HTTPSConnection if secure else HTTPConnection)(host, port, timeout=timeout)
 
 
 def upstream_prefix() -> str:
@@ -329,8 +375,12 @@ def normalize_tools(tools):
     for t in tools:
         if not isinstance(t, dict):
             continue
-        src = t.get("custom", t) if (t.get("type") == "custom" and isinstance(t.get("custom"), dict)) else t
-        clean = {k: src[k] for k in ("name", "description", "input_schema") if k in src}
+        clean = dict(t)
+        nested = clean.pop("custom", None)
+        if isinstance(nested, dict):
+            clean.update(nested)
+        if clean.get("type") == "custom":
+            clean.pop("type")
         if clean.get("name"):
             out.append(clean)
     return out
@@ -344,10 +394,6 @@ def normalize_payload(p: dict) -> dict:
         p["model"] = canonical_model(p.get("model"))
     if isinstance(p.get("tools"), list):
         p["tools"] = normalize_tools(p["tools"])
-    # DeepSeek 类可能拒绝强制 tool_choice={type:tool,...}，自动选择更稳
-    tc = p.get("tool_choice")
-    if isinstance(tc, dict) and tc.get("type") == "tool":
-        p["tool_choice"] = {"type": "auto"}
     return p
 
 
@@ -434,7 +480,7 @@ def _record_sanitize_memory(provider_id, original: dict, sanitized: dict) -> Non
 
 
 def _apply_sanitize_memory(payload: dict, entry: dict) -> dict:
-    p = dict(payload)
+    p = copy.deepcopy(payload)
     for k in entry.get("top_removed") or ():
         p.pop(k, None)
     if entry.get("extras"):
@@ -450,6 +496,46 @@ def _apply_sanitize_memory(payload: dict, entry: dict) -> dict:
             else:
                 p.pop("system", None)
     return p
+
+
+def _compatibility_key(state: dict, model: str) -> str:
+    active = state.get("active") or {}
+    identity = (state.get("channel"), active.get("id"), model,
+                active.get("api_format"), active.get("env"), state.get("model_entries"))
+    return hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
+
+
+def _targeted_retry(payload: dict, status: int, error: str):
+    # Only optional, non-semantic top-level fields are eligible for automatic removal.
+    if status not in (400, 422):
+        return None
+    removed = []
+    for field in ("metadata", "service_tier"):
+        name = r"[\"']?" + field + r"[\"']?"
+        pattern = (r"(?:unknown|unexpected|extra|unsupported)\s+(?:field\s+|key\s+)?" + name +
+                   r"\b|\b" + name + r"\s+(?:is\s+)?(?:not (?:allowed|supported)|unsupported)")
+        if field in payload and re.search(pattern, error, re.IGNORECASE):
+            removed.append(field)
+    if not removed:
+        return None
+    retry = copy.deepcopy(payload)
+    for field in removed:
+        retry.pop(field)
+    return retry
+
+
+def _legacy_retry(payload: dict, status: int, error: str):
+    if os.getenv("EDGE_LEGACY_SANITIZE", "0") != "1" or status not in (400, 422):
+        return None
+    if not _RETRYABLE_4XX.search(error):
+        return None
+    retry = deep_sanitize(copy.deepcopy(payload))
+    if isinstance(retry.get("tool_choice"), dict) and retry["tool_choice"].get("type") == "tool":
+        retry["tool_choice"] = {"type": "auto"}
+    if isinstance(retry.get("tools"), list):
+        retry["tools"] = [{k: t[k] for k in ("name", "description", "input_schema") if k in t}
+                          for t in retry["tools"]]
+    return retry if retry != payload else None
 
 
 def _ensure_anthropic_error(status: int, data: bytes) -> bytes:
@@ -475,6 +561,19 @@ def _ensure_anthropic_error(status: int, data: bytes) -> bytes:
     return json.dumps({"type": "error",
                        "error": {"type": "api_error", "message": message or f"upstream HTTP {status}"}},
                       ensure_ascii=False).encode("utf-8")
+
+
+def _redact_error_bytes(data: bytes) -> bytes:
+    text = data.decode("utf-8", "replace")
+    patterns = (
+        r'(?i)("?(?:api[_-]?key|token|authorization|secret|password)"?\s*[:=]\s*")([^"]+)(")',
+        r'(?i)(Bearer\s+)([A-Za-z0-9._~+/-]{8,})',
+        r'\bsk-[A-Za-z0-9_-]{8,}\b',
+    )
+    text = re.sub(patterns[0], r'\1***REDACTED***\3', text)
+    text = re.sub(patterns[1], r'\1***REDACTED***', text)
+    text = re.sub(patterns[2], 'sk-***REDACTED***', text)
+    return text.encode("utf-8")
 
 
 def _gateway_error(code, message, suggestion=None, err_type="invalid_request_error"):
@@ -540,7 +639,7 @@ def files_conn():
     try:
         with _file_lock:
             yield con
-        con.commit()
+            con.commit()
     finally:
         con.close()
 
@@ -571,9 +670,9 @@ def storage_used() -> int:
 
 def _enforce_quota():
     """磁盘配额：先清过期，仍超额则按最旧优先淘汰。FILE_QUOTA_BYTES<=0 表示不限额。"""
+    prune_expired()
     if FILE_QUOTA_BYTES <= 0:
         return
-    prune_expired()
     with files_conn() as con:
         rows = con.execute("SELECT id, size FROM files ORDER BY created_at ASC").fetchall()
     total = sum(int(r[1] or 0) for r in rows)
@@ -617,8 +716,20 @@ def _ext(name: str) -> str:
     return os.path.splitext(name or "")[1].lower()
 
 
+def _safe_filename(name: str) -> str:
+    value = os.path.basename((name or "upload").replace("\\", "/"))
+    value = re.sub(r'[\r\n"\\]', "_", value).strip()
+    return (value or "upload")[:255]
+
+
 def files_create(filename, content_type, data: bytes, purpose, expires_in_seconds):
+    with _file_lock:
+        return _files_create_locked(filename, content_type, data, purpose, expires_in_seconds)
+
+
+def _files_create_locked(filename, content_type, data: bytes, purpose, expires_in_seconds):
     _enforce_quota()
+    filename = _safe_filename(filename)
     if len(data) > MAX_FILE_BYTES:
         raise FileInlineError(413, f"file too large, max {MAX_FILE_BYTES} bytes", gateway_code="file_too_large")
     if FILE_QUOTA_BYTES > 0 and storage_used() + len(data) > FILE_QUOTA_BYTES:
@@ -937,7 +1048,8 @@ def anthropic_to_openai(ant: dict, req_model: str) -> dict:
 # 上游往返（透明优先，4xx 可兼容则深度清洗重试一次；支持 SSE）
 # --------------------------------------------------------------------------- #
 def _upstream_headers(handler):
-    token = expected_token()
+    state = getattr(handler, "_request_state", None) or read_ccswitch_state()
+    token = state.get("token", "") or os.getenv("EDGE_TOKEN", "").strip()
     if not token and handler is not None:
         auth = handler.headers.get("Authorization", "")
         token = (auth[7:].strip() if auth.lower().startswith("bearer ")
@@ -976,8 +1088,8 @@ def _checked_sse_line(line: bytes) -> bytes:
 
 def upstream_roundtrip(handler, upstream_path, payload, stream, sanitized=False, provider_id=None, original_payload=None):
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    host, port, _ = _split_base(CCSWITCH_BASE)
-    conn = HTTPConnection(host, port, timeout=600 if stream else 300)
+    conn = _connection(600 if stream else 300)
+    streaming_started = False
     try:
         conn.request("POST", upstream_path, body=body, headers=_upstream_headers(handler))
         resp = conn.getresponse()
@@ -985,18 +1097,29 @@ def upstream_roundtrip(handler, upstream_path, payload, stream, sanitized=False,
             err = resp.read()
             conn.close()
             text = err.decode("utf-8", "ignore")
-            if (not sanitized) and _RETRYABLE_4XX.search(text):
-                _log("upstream 4xx -> deep-sanitize retry:", text[:160].replace("\n", " "))
-                retry = deep_sanitize(json.loads(json.dumps(payload)))  # 深拷贝
+            retry = None if sanitized else _targeted_retry(payload, resp.status, text)
+            legacy = False
+            if retry is None and not sanitized:
+                retry = _legacy_retry(payload, resp.status, text)
+                legacy = retry is not None
+            if retry is not None:
+                _log("retrying once:", "explicit legacy sanitization" if legacy else "rejected optional field")
                 result = upstream_roundtrip(handler, upstream_path, retry, stream,
                                             sanitized=True, provider_id=provider_id)
-                if provider_id and getattr(handler, "_last_status", 500) < 400:
+                if not legacy and provider_id and getattr(handler, "_last_status", 500) < 400:
                     # 重试成功：记住该供应商的差异，后续请求预清洗（ADR-0008）
-                    _record_sanitize_memory(provider_id, original_payload or payload, retry)
+                    original = original_payload or payload
+                    if len(_SANITIZE_MEMORY) >= 128:
+                        _SANITIZE_MEMORY.clear()
+                    _SANITIZE_MEMORY[provider_id] = {
+                        "top_removed": tuple(k for k in original if k not in retry),
+                        "extras": False,
+                        "expires": time.monotonic() + 300,
+                    }
                 return result
             try:
                 with open(os.path.join(DATA_DIR, "last-upstream-error.txt"), "wb") as fh:
-                    fh.write(("HTTP %s\n" % resp.status).encode() + err)
+                    fh.write(("HTTP %s\n" % resp.status).encode() + _redact_error_bytes(err))
             except Exception:
                 pass
             ct = "application/json"
@@ -1004,12 +1127,13 @@ def upstream_roundtrip(handler, upstream_path, payload, stream, sanitized=False,
                                           [("Content-Type", ct)])
         if stream:
             handler.begin_sse(resp.status)
+            streaming_started = True
             # 逐行校验 data: 载荷后再转发：畸形事件替换为明确的 gateway_bad_event，
             # 避免让 Office 前端的 JSON 解析崩溃（对齐另一台实测机器的健壮性设计）。
             buf = b""
             try:
                 while True:
-                    chunk = resp.read(2048)
+                    chunk = resp.read1(2048)
                     if not chunk:
                         break
                     buf += chunk
@@ -1023,14 +1147,18 @@ def upstream_roundtrip(handler, upstream_path, payload, stream, sanitized=False,
         else:
             data = resp.read(); conn.close()
             handler.proxy_response(resp.status, data, [("Content-Type", resp.getheader("Content-Type") or "application/json")])
-    except (ConnectionError, OSError, BrokenPipeError) as exc:
+    except (OSError, HTTPException) as exc:
         try:
             conn.close()
         except Exception:
             pass
         _log("UPSTREAM UNREACHABLE:", type(exc).__name__, exc)
         try:
-            handler._json(502, _gateway_error("ccswitch_unreachable", f"cc-switch/upstream unreachable: {exc}",
+            if streaming_started:
+                event = _gateway_error("upstream_stream_interrupted", "Upstream stream interrupted", err_type="api_error")
+                handler.write_chunk(("event: error\ndata: " + json.dumps(event) + "\n\n").encode())
+            else:
+                handler._json(502, _gateway_error("ccswitch_unreachable", f"cc-switch/upstream unreachable: {exc}",
                                   "确认 CC Switch 正在运行（内置代理 127.0.0.1:15721）且当前供应商可用；可用 diagnose.ps1 收集详情",
                                   "api_error"))
         except Exception:
@@ -1039,8 +1167,7 @@ def upstream_roundtrip(handler, upstream_path, payload, stream, sanitized=False,
 
 def openai_stream_from_anthropic(handler, upstream_path, payload, req_model):
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    host, port, _ = _split_base(CCSWITCH_BASE)
-    conn = HTTPConnection(host, port, timeout=600)
+    conn = _connection(600)
     conn.request("POST", upstream_path, body=body, headers=_upstream_headers(handler))
     resp = conn.getresponse()
     if resp.status >= 400:
@@ -1057,7 +1184,7 @@ def openai_stream_from_anthropic(handler, upstream_path, payload, req_model):
     buf = b""
     try:
         while True:
-            raw = resp.read(2048)
+            raw = resp.read1(2048)
             if not raw:
                 break
             buf += raw
@@ -1095,13 +1222,30 @@ class EdgeHandler(BaseHTTPRequestHandler):
     server_version = f"OfficeEdge/{VERSION}"
     protocol_version = "HTTP/1.1"
 
+    def handle_one_request(self):
+        try:
+            super().handle_one_request()
+        except (ConnectionError, TimeoutError):
+            self.close_connection = True
+
+    def _allow_origin(self):
+        origin = self._origin()
+        if origin and origin not in ALLOWED_ORIGINS:
+            self.close_connection = True
+            self._json(403, _gateway_error("origin_not_allowed", "Origin is not allowed"))
+            return False
+        return True
+
     def _origin(self):
-        return self.headers.get("Origin", "*")
+        return self.headers.get("Origin", "").strip()
 
     def _cors(self, preflight=False):
-        self.send_header("Access-Control-Allow-Origin", self._origin())
-        self.send_header("Access-Control-Allow-Credentials", "true")
         self.send_header("Vary", "Origin")
+        origin = self._origin()
+        if origin not in ALLOWED_ORIGINS:
+            return
+        self.send_header("Access-Control-Allow-Origin", origin)
+        self.send_header("Access-Control-Allow-Credentials", "true")
         if preflight:
             self.send_header("Access-Control-Allow-Methods", "GET,POST,OPTIONS,PUT,DELETE")
             req_headers = self.headers.get("Access-Control-Request-Headers", "")
@@ -1122,7 +1266,7 @@ class EdgeHandler(BaseHTTPRequestHandler):
         self._cors(); self.end_headers()
         try:
             self.wfile.write(body)
-        except BrokenPipeError:
+        except OSError:
             pass
 
     def _presented_token(self, query):
@@ -1137,11 +1281,12 @@ class EdgeHandler(BaseHTTPRequestHandler):
         return q("gateway_token") or q("access_token")
 
     def _check_auth(self, query):
-        want = expected_tokens()
-        if not want:
-            _log("WARN: no gateway token available, auth bypassed")
-            return True
-        return self._presented_token(query) in want
+        presented = self._presented_token(query)
+        fixed = os.getenv("EDGE_TOKEN", "").strip()
+        if not fixed:
+            return bool(presented)
+        live = read_ccswitch_state().get("token", "")
+        return presented in {token for token in (fixed, live) if token}
 
     def proxy_response(self, status, data, headers, conn=None):
         self._last_status = status
@@ -1156,7 +1301,7 @@ class EdgeHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data))); self._cors(); self.end_headers()
         try:
             self.wfile.write(data)
-        except BrokenPipeError:
+        except OSError:
             pass
         if conn:
             conn.close()
@@ -1187,7 +1332,7 @@ class EdgeHandler(BaseHTTPRequestHandler):
             if os.path.exists(ACCESS_LOG) and os.path.getsize(ACCESS_LOG) > ACCESS_LOG_MAX:
                 os.replace(ACCESS_LOG, ACCESS_LOG + ".1")  # 简单轮转，防止长期运行无限增长
             line = "%s %s %s | origin=%s auth=%s acrm=%s clen=%s\n" % (
-                time.strftime("%H:%M:%S"), method, self.path, self.headers.get("Origin", "-"),
+                time.strftime("%H:%M:%S"), method, urllib.parse.urlsplit(self.path).path, self.headers.get("Origin", "-"),
                 "yes" if (self.headers.get("Authorization") or self.headers.get("x-api-key")) else "no",
                 self.headers.get("Access-Control-Request-Method", "-"), self.headers.get("Content-Length", "0"))
             with open(ACCESS_LOG, "a", encoding="utf-8") as fh:
@@ -1197,23 +1342,27 @@ class EdgeHandler(BaseHTTPRequestHandler):
 
     # ---------------- OPTIONS ---------------- #
     def do_OPTIONS(self):
+        if not self._allow_origin():
+            return
         self._access("OPTIONS")
         self.send_response(204); self._cors(preflight=True)
         self.send_header("Content-Length", "0"); self.end_headers()
 
     # ---------------- GET ---------------- #
     def do_GET(self):
+        if not self._allow_origin():
+            return
         self._access("GET")
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path.rstrip("/") or "/"
         query = urllib.parse.parse_qs(parsed.query)
         if path in ("/healthz", "/health"):
-            state = read_ccswitch_state(force=True); active = state.get("active") or {}
+            state = _state_cache; active = state.get("active") or {}
             payload = {"status": "ok", "edge": "office_edge", "version": VERSION,
                        "ccswitch_channel": state.get("channel"),
                        "ccswitch_proxy": CCSWITCH_BASE + state.get("prefix", ""),
                        "active_provider": active.get("name"),
-                       "upstream_base_url": active.get("env", {}).get("ANTHROPIC_BASE_URL"),
+                       "upstream_configured": bool(active.get("env", {}).get("ANTHROPIC_BASE_URL")),
                        "api_format": active.get("api_format"),
                        "model_routes": active.get("routes")}
             if state.get("diagnosis"):
@@ -1221,11 +1370,11 @@ class EdgeHandler(BaseHTTPRequestHandler):
                 payload["suggestion"] = state.get("suggestion")
             return self._json(200, payload)
         if path == "/status/ccswitch":
-            return self._json(200, read_ccswitch_state(force=True))
+            return self._json(200, public_ccswitch_state())
         if not self._check_auth(query):
             return self._json(401, _gateway_error("invalid_gateway_token", "invalid gateway token",
                                                   "检查 Office Gateway 配置里的 Token（占位模式填 PROXY_MANAGED）；"
-                                                  "旧版 CC Switch 可在 /status/ccswitch 查看实时令牌",
+                                                  "占位模式填 PROXY_MANAGED；设置 EDGE_TOKEN 后必须使用该固定令牌",
                                                   "authentication_error"))
         if path in ("/v1/models", "/models"):
             state = read_ccswitch_state(force=True)
@@ -1244,13 +1393,16 @@ class EdgeHandler(BaseHTTPRequestHandler):
         self._json(404, {"error": {"message": "not found", "path": path}})
 
     def _simple_proxy_get(self, upstream_path):
-        token = expected_token()
-        host, port, _ = _split_base(CCSWITCH_BASE)
-        conn = HTTPConnection(host, port, timeout=60)
-        conn.request("GET", upstream_path, headers={"Authorization": f"Bearer {token}", "x-api-key": token,
-                                                    "anthropic-version": "2023-06-01", "Accept": "application/json"})
-        resp = conn.getresponse(); data = resp.read(); conn.close()
-        self.proxy_response(resp.status, data, [("Content-Type", resp.getheader("Content-Type") or "application/json")])
+        conn = _connection(60)
+        try:
+            conn.request("GET", upstream_path, headers=_upstream_headers(self))
+            resp = conn.getresponse()
+            data = resp.read()
+            self.proxy_response(resp.status, data, [("Content-Type", resp.getheader("Content-Type") or "application/json")])
+        except (OSError, HTTPException):
+            self._json(502, _gateway_error("ccswitch_unreachable", "CC Switch is unreachable", err_type="api_error"))
+        finally:
+            conn.close()
 
     def _file_content(self, fid):
         meta, data = files_blob(fid)
@@ -1261,15 +1413,18 @@ class EdgeHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", meta.get("content_type") or "application/octet-stream")
         self.send_header("Content-Length", str(len(data)))
-        self.send_header("Content-Disposition", f'attachment; filename="{meta.get("filename", fid)}"')
+        filename = urllib.parse.quote(_safe_filename(meta.get("filename", fid)), safe="")
+        self.send_header("Content-Disposition", f"attachment; filename=attachment; filename*=UTF-8''{filename}")
         self._cors(); self.end_headers()
         try:
             self.wfile.write(data)
-        except BrokenPipeError:
+        except OSError:
             pass
 
     # ---------------- DELETE ---------------- #
     def do_DELETE(self):
+        if not self._allow_origin():
+            return
         self._access("DELETE")
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path.rstrip("/") or "/"
@@ -1277,7 +1432,7 @@ class EdgeHandler(BaseHTTPRequestHandler):
         if not self._check_auth(query):
             return self._json(401, _gateway_error("invalid_gateway_token", "invalid gateway token",
                                                   "检查 Office Gateway 配置里的 Token（占位模式填 PROXY_MANAGED）；"
-                                                  "旧版 CC Switch 可在 /status/ccswitch 查看实时令牌",
+                                                  "占位模式填 PROXY_MANAGED；设置 EDGE_TOKEN 后必须使用该固定令牌",
                                                   "authentication_error"))
         m = re.fullmatch(r"/v1/files/([A-Za-z0-9_]+)", path)
         if m:
@@ -1289,6 +1444,8 @@ class EdgeHandler(BaseHTTPRequestHandler):
 
     # ---------------- POST ---------------- #
     def do_POST(self):
+        if not self._allow_origin():
+            return
         self._access("POST")
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path.rstrip("/") or "/"
@@ -1296,9 +1453,17 @@ class EdgeHandler(BaseHTTPRequestHandler):
         if not self._check_auth(query):
             return self._json(401, _gateway_error("invalid_gateway_token", "invalid gateway token",
                                                   "检查 Office Gateway 配置里的 Token（占位模式填 PROXY_MANAGED）；"
-                                                  "旧版 CC Switch 可在 /status/ccswitch 查看实时令牌",
+                                                  "占位模式填 PROXY_MANAGED；设置 EDGE_TOKEN 后必须使用该固定令牌",
                                                   "authentication_error"))
-        length = int(self.headers.get("Content-Length", 0) or 0)
+        self.close_connection = True
+        if self.headers.get("Transfer-Encoding"):
+            return self._json(400, _gateway_error("invalid_body", "Transfer-Encoding is not supported"))
+        try:
+            length = int(self.headers.get("Content-Length", 0) or 0)
+            if length < 0:
+                raise ValueError()
+        except ValueError:
+            return self._json(400, _gateway_error("invalid_length", "Invalid Content-Length"))
         if length > MAX_BODY:
             return self._json(413, _gateway_error("body_too_large", "body too large", f"单请求上限 {MAX_BODY} 字节"))
         raw = self.rfile.read(length) if length else b""
@@ -1307,20 +1472,23 @@ class EdgeHandler(BaseHTTPRequestHandler):
         if path in ("/v1/files", "/files"):
             return self._files_upload(raw)
         # count_tokens：原样透传，上游不支持就把 404 如实带回（不伪造精确 token）
+        self._request_state = read_ccswitch_state()
         if path.endswith("/v1/messages/count_tokens"):
-            return self._raw_proxy_post(upstream_prefix() + "/v1/messages/count_tokens", raw)
+            return self._raw_proxy_post(self._request_state.get("prefix", "") + "/v1/messages/count_tokens", raw)
 
         try:
             payload = json.loads(raw.decode("utf-8")) if raw else {}
         except Exception:
             return self._json(400, _gateway_error("invalid_json", "invalid JSON body", "请求体必须是合法的 JSON 对象"))
-        state = read_ccswitch_state()
+        if not isinstance(payload, dict):
+            return self._json(400, _gateway_error("invalid_json", "Request body must be a JSON object"))
+        state = self._request_state
         provider = (state.get("active") or {}).get("name")
 
         # Anthropic Messages
         messages_paths = {"/v1/messages", "/messages", upstream_prefix() + "/v1/messages"}
         if path in messages_paths:
-            provider_id = (state.get("active") or {}).get("id")
+            provider_id = _compatibility_key(state, canonical_model(payload.get("model", "")))
             try:
                 payload = normalize_payload(payload)
                 payload = expand_file_refs(payload)
@@ -1331,11 +1499,14 @@ class EdgeHandler(BaseHTTPRequestHandler):
             original_payload = payload  # 记忆预清洗前的透明报文，用于差异记忆
             # 供应商指纹记忆：已学会该供应商拒绝某些字段时，直接预清洗（ADR-0008）
             memo = _SANITIZE_MEMORY.get(provider_id)
+            if memo and memo.get("expires", 0) <= time.monotonic():
+                _SANITIZE_MEMORY.pop(provider_id, None)
+                memo = None
             if memo:
                 payload = _apply_sanitize_memory(payload, memo)
             _log(f"POST /v1/messages provider={provider} model={payload.get('model')} stream={payload.get('stream')}"
                  + (" [pre-sanitized]" if memo else ""))
-            return upstream_roundtrip(self, upstream_prefix() + "/v1/messages", payload,
+            return upstream_roundtrip(self, state.get("prefix", "") + "/v1/messages", payload,
                                       bool(payload.get("stream")), provider_id=provider_id,
                                       original_payload=original_payload)
 
@@ -1354,17 +1525,16 @@ class EdgeHandler(BaseHTTPRequestHandler):
         self._json(404, {"error": {"message": "not found", "path": path}})
 
     def _raw_proxy_post(self, upstream_path, raw: bytes):
-        token = expected_token()
-        host, port, _ = _split_base(CCSWITCH_BASE)
-        conn = HTTPConnection(host, port, timeout=120)
-        h = {"Authorization": f"Bearer {token}", "x-api-key": token,
-             "anthropic-version": self.headers.get("anthropic-version", "2023-06-01"),
-             "Content-Type": self.headers.get("Content-Type", "application/json")}
-        if self.headers.get("anthropic-beta"):
-            h["anthropic-beta"] = self.headers["anthropic-beta"]
-        conn.request("POST", upstream_path, body=raw, headers=h)
-        resp = conn.getresponse(); data = resp.read(); conn.close()
-        self.proxy_response(resp.status, data, [("Content-Type", resp.getheader("Content-Type") or "application/json")])
+        try:
+            payload = json.loads(raw)
+            if not isinstance(payload, dict):
+                raise ValueError()
+            payload = expand_file_refs(normalize_payload(payload))
+        except (ValueError, TypeError):
+            return self._json(400, _gateway_error("invalid_json", "Request body must be a JSON object"))
+        except FileInlineError as exc:
+            return self._json(exc.code, _file_error(exc))
+        return upstream_roundtrip(self, upstream_path, payload, False, sanitized=True)
 
     def _files_upload(self, raw: bytes):
         ctype = self.headers.get("Content-Type", "")
@@ -1390,8 +1560,7 @@ class EdgeHandler(BaseHTTPRequestHandler):
 
     def _openai_nonstream(self, ant, req_model):
         body = json.dumps(ant, ensure_ascii=False).encode("utf-8")
-        host, port, _ = _split_base(CCSWITCH_BASE)
-        conn = HTTPConnection(host, port, timeout=300)
+        conn = _connection(300)
         conn.request("POST", upstream_prefix() + "/v1/messages", body=body, headers=_upstream_headers(self))
         resp = conn.getresponse(); data = resp.read(); conn.close()
         if resp.status >= 400:

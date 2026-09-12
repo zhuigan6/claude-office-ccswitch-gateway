@@ -3,6 +3,24 @@
 本文件遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/) 格式，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。给人看，不放 git log。
 
+## [3.4.0] - 2026-09-12
+
+### Fixed
+- Repair developer manifest generation: restore the historical three-host shared-runtime template, load the official frontend, encode gateway/token parameters and back up an existing output before replacement.
+- Retain historical deep-sanitization as an explicit `EDGE_LEGACY_SANITIZE=1` opt-in, disabled by default and never learned across models (ADR-0009).
+- Preserve native tool definitions, extension fields and forced tool selection; restrict automatic retries to explicitly rejected optional fields on 400/422.
+- Refresh CC Switch state after WAL-only updates. Scope compatibility memory by model/configuration and expire it after five minutes.
+- Forward small SSE events immediately; never send a second HTTP response after a stream starts. Normalize count_tokens model aliases and credentials without fabricating counts.
+- Handle invalid JSON shapes, invalid request lengths and Unicode attachment download names. Serialize file quota checks and keep expiry cleanup active without a quota.
+- Add windowless supervisor logging, 64-bit Windows process-handle checks, closed child log handles and a real pythonw restart regression.
+
+### Security
+- Exact Origin allowlist for preflight and actual requests; remove tokens/provider environments from public diagnostics and query strings from access logs.
+- Require a nonempty placeholder token when no fixed token is configured; retain internally managed legacy-channel credentials.
+- Do not terminate unrelated processes based on port ownership alone. Preserve existing ports, task names and Office data during upgrades.
+
+See [upgrade notes](docs/UPGRADE-3.4.md) for changed authentication and retry behavior.
+
 ## [3.3.0] - 2026-09-06
 
 主题：可运维性——报错可行动、磁盘有配额、故障能自述。

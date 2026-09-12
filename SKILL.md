@@ -28,7 +28,7 @@
 
 ## B. Office 侧配置（二选一）
 
-- **方式 A（新版加载项有 Gateway 配置界面）**：`URL http://127.0.0.1:8790`、`Token PROXY_MANAGED`、`Header x-api-key`、`Format Anthropic Messages`。若发消息报 401：读取 `http://127.0.0.1:8790/status/ccswitch` 返回 JSON 的 `token` 字段填入（**此值是机密，不要外传**）
+- **方式 A（新版加载项有 Gateway 配置界面）**：`URL http://127.0.0.1:8790`、`Token PROXY_MANAGED`、`Header x-api-key`、`Format Anthropic Messages`。若配置了固定 `EDGE_TOKEN`，Office 使用该令牌。401 时核对现有配置；状态接口不会返回令牌。
 - **方式 B（老版加载项无界面）**：`.\scripts\New-OfficeManifest.ps1` 生成清单 → `.\scripts\Install-DeveloperSideload.ps1 -Manifest .\sideload\claude-office-ccswitch-gateway.xml` → 重启 Office
 
 ## C. 升级
@@ -89,7 +89,7 @@ Office 报 502 / inference gateway unreachable
 
 ```powershell
 curl.exe --noproxy "*" http://127.0.0.1:8790/healthz          # 版本/通道/供应商/诊断
-curl.exe --noproxy "*" http://127.0.0.1:8790/status/ccswitch  # 实时状态（含令牌，勿外传）
+curl.exe --noproxy "*" http://127.0.0.1:8790/status/ccswitch  # 实时状态（不含令牌及完整供应商环境）
 Get-NetTCPConnection -State Listen -LocalPort 8790            # 端口监听
 .\diagnose.ps1 -OutFile report.txt                            # 一键全量诊断（脱敏）
 ```

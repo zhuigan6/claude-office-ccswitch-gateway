@@ -34,7 +34,7 @@ WebView2/Chromium 视 loopback 为可信地址，HTTPS 页面可直接请求 `ht
 | 模型来源 | `meta.claudeDesktopModelRoutes` | `settings_config.env` 的 `ANTHROPIC_*_MODEL` 五槽位 |
 | 上游路径前缀 | `/claude-desktop` | 空（`/v1/messages`） |
 
-`CCSWITCH_CHANNEL=auto`（默认）按"当前启用的供应商行存在于哪张类型下"自动判定；也可显式指定。**因为每请求都重读数据库，CC Switch GUI 切换供应商后下一句话立即生效**——这是"热切换"的全部原理。
+`CCSWITCH_CHANNEL=auto` 优先 `claude-desktop`，两个分类同时存在时应按使用需求显式选择。缓存检查主库与 WAL 的纳秒时间及大小；变化时只读刷新。健康页只读取缓存，诊断接口强制刷新，避免上游暂不可用时误重启网关。
 
 ## 4. 模型别名机制
 
@@ -43,8 +43,8 @@ Office 会过滤不含 `claude` 的模型 ID。网关把当前供应商的槽位
 ## 5. 兼容策略：透明优先 + 自动降级
 
 1. 默认**全量透传**（保留 thinking、图片、文档、工具、metadata、beta 头，不阉割能力）；
-2. 仅做无损归一化：`tools[].custom` 两种外壳解包、`tool_choice={type:tool}` 转 `auto`（部分上游拒绝强制工具）、模型别名还原；
-3. 仅当上游返回"字段不支持"类 4xx 时，自动深度清洗（去 thinking/cache_control/citations/metadata、规整 system 与工具）并**重试一次**；
+2. 仅解包 `tools[].custom`、还原模型别名，保留原生工具字段和强制工具选择；
+3. 仅当 400/422 明确拒绝 metadata/service_tier 时删除对应字段并重试一次。按供应商、通道、模型与配置记忆五分钟；思考、图片、工具与系统提示不自动删除；
 4. 仍失败则把上游错误**如实**带回（同时落盘 `runtime/last-upstream-error.txt`），绝不伪造成功。
 
 ## 6. Files API 与安全
@@ -64,6 +64,9 @@ Office 会过滤不含 `claude` 的模型 ID。网关把当前供应商的槽位
 - 守护每 5 秒真正请求 `/healthz`（不是看端口/进程），连续 3 次失败才重启——识别"端口还在但服务假死"
 - `/healthz` 只代表网关自身，不因 CC Switch 暂未启动而误杀网关
 - 自启优先用户级计划任务；注册被拒（策略限制）自动回退 HKCU Run 键
+- supervisor 只终止自己创建的子进程；遇到未知端口占用时等待并记录。无控制台日志写入 `runtime/supervisor.log`。
+
+v3.4 的来源白名单、认证和迁移边界见 [升级说明](UPGRADE-3.4.md)。
 
 ## 8. 稳定性优先级
 

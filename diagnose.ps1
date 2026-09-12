@@ -5,7 +5,8 @@
 [CmdletBinding()]
 param(
     [int]$Port = 0,
-    [string]$OutFile = ""
+    [string]$OutFile = "",
+    [string]$TaskName = "Claude Office Gateway"
 )
 
 $ErrorActionPreference = "Continue"
@@ -57,10 +58,9 @@ try {
     Add-Line ("model_routes=" + (($h.model_routes.PSObject.Properties | ForEach-Object { "$($_.Name)=$($_.Value)" }) -join ", "))
 } catch { Add-Line ("healthz 不可达: " + $_.Exception.Message) }
 
-Add-Section "CC Switch 状态（令牌已打码）"
+Add-Section "CC Switch 状态（服务端已脱敏）"
 try {
     $s = Invoke-RestMethod -Uri "http://127.0.0.1:$Port/status/ccswitch" -TimeoutSec 5
-    $s.token = "***REDACTED***"
     Add-Line (Hide-Secret (ConvertTo-Json $s -Depth 5 -Compress))
 } catch { Add-Line ("status/ccswitch 不可达: " + $_.Exception.Message) }
 
@@ -78,10 +78,10 @@ Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue | Where-Object 
     ForEach-Object { Add-Line ("pid=" + $_.OwningProcess + "  addr=" + $_.LocalAddress + ":" + $_.LocalPort) }
 
 Add-Section "开机自启"
-$task = Get-ScheduledTask -TaskName "Claude Office Gateway" -ErrorAction SilentlyContinue
-Add-Line ("计划任务 'Claude Office Gateway': " + $(if ($task) { $task.State } else { "不存在" }))
-$runVal = (Get-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -ErrorAction SilentlyContinue)."Claude Office Gateway"
-Add-Line ("HKCU Run 'Claude Office Gateway': " + $(if ($runVal) { $runVal } else { "不存在" }))
+$task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+Add-Line ("计划任务 '$TaskName': " + $(if ($task) { $task.State } else { "不存在" }))
+$runVal = (Get-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -ErrorAction SilentlyContinue).$TaskName
+Add-Line ("HKCU Run '$TaskName': " + $(if ($runVal) { $runVal } else { "不存在" }))
 Add-Line ("HKCU Run 旧键 'CCSwitchOfficeSupervisor': " +
     $(if ((Get-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -ErrorAction SilentlyContinue)."CCSwitchOfficeSupervisor") { "仍存在（旧版残留）" } else { "不存在" }))
 

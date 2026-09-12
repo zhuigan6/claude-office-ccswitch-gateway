@@ -1,0 +1,122 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Claude for Microsoft Office（Word/Excel/PowerPoint 三件套统一）侧载清单
+  由 scripts/New-OfficeManifest.ps1 用本机 CC Switch 网关参数填充占位符后生成可侧载文件。
+  占位符：__ADDIN_ID__ / __ADDIN_VERSION__ / __DISPLAY_NAME__
+          __GATEWAY_URL_ENC__（URL 编码后的网关基址） / __GATEWAY_TOKEN__ / __API_FORMAT__
+  前端仍是官方 https://pivot.claude.ai，仅通过 gateway_url 把推理请求导向本机网关。
+-->
+<OfficeApp xmlns="http://schemas.microsoft.com/office/appforoffice/1.1" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:bt="http://schemas.microsoft.com/office/officeappbasictypes/1.0" xsi:type="TaskPaneApp">
+  <Id>__ADDIN_ID__</Id>
+  <Version>__ADDIN_VERSION__</Version>
+  <ProviderName>Anthropic (via CC Switch local gateway)</ProviderName>
+  <DefaultLocale>en-US</DefaultLocale>
+  <DisplayName DefaultValue="__DISPLAY_NAME__" />
+  <Description DefaultValue="Claude in Microsoft Office, routed through local CC Switch gateway" />
+  <IconUrl DefaultValue="https://pivot.claude.ai/icon-32.png" />
+  <HighResolutionIconUrl DefaultValue="https://pivot.claude.ai/icon-64.png" />
+  <SupportUrl DefaultValue="https://support.claude.com" />
+  <AppDomains>
+    <AppDomain>https://claude.ai</AppDomain>
+    <AppDomain>https://pivot.claude.ai</AppDomain>
+  </AppDomains>
+  <Hosts>
+    <Host Name="Workbook" />
+    <Host Name="Document" />
+    <Host Name="Presentation" />
+  </Hosts>
+  <Requirements>
+    <Sets DefaultMinVersion="1.1">
+      <Set Name="SharedRuntime" MinVersion="1.1" />
+    </Sets>
+  </Requirements>
+  <DefaultSettings>
+    <SourceLocation DefaultValue="https://pivot.claude.ai/?m=unified-1.0.0.12&amp;gateway_url=__GATEWAY_URL_ENC__&amp;gateway_token=__GATEWAY_TOKEN__&amp;gateway_api_format=__API_FORMAT__" />
+  </DefaultSettings>
+  <Permissions>ReadWriteDocument</Permissions>
+  <VersionOverrides xmlns="http://schemas.microsoft.com/office/taskpaneappversionoverrides" xsi:type="VersionOverridesV1_0">
+    <Hosts>
+      <Host xsi:type="Workbook">
+        <Runtimes><Runtime resid="Taskpane.Url" lifetime="long" /></Runtimes>
+        <DesktopFormFactor>
+          <GetStarted><Title resid="GetStarted.Title" /><Description resid="GetStarted.Description" /><LearnMoreUrl resid="GetStarted.LearnMoreUrl" /></GetStarted>
+          <FunctionFile resid="Taskpane.Url" />
+          <ExtensionPoint xsi:type="PrimaryCommandSurface">
+            <OfficeTab id="TabHome">
+              <Group id="CommandsGroup.Excel"><Label resid="CommandsGroup.Label" />
+                <Icon><bt:Image size="16" resid="Icon.16x16" /><bt:Image size="32" resid="Icon.32x32" /><bt:Image size="80" resid="Icon.80x80" /></Icon>
+                <Control xsi:type="Button" id="TaskpaneButton.Excel">
+                  <Label resid="TaskpaneButton.Label" />
+                  <Supertip><Title resid="TaskpaneButton.Label" /><Description resid="TaskpaneButton.Tooltip" /></Supertip>
+                  <Icon><bt:Image size="16" resid="Icon.16x16" /><bt:Image size="32" resid="Icon.32x32" /><bt:Image size="80" resid="Icon.80x80" /></Icon>
+                  <Action xsi:type="ShowTaskpane"><TaskpaneId>Office.AutoShowTaskpaneWithDocument</TaskpaneId><SourceLocation resid="Taskpane.Url" /></Action>
+                </Control>
+              </Group>
+            </OfficeTab>
+          </ExtensionPoint>
+        </DesktopFormFactor>
+      </Host>
+      <Host xsi:type="Document">
+        <Runtimes><Runtime resid="Taskpane.Url" lifetime="long" /></Runtimes>
+        <DesktopFormFactor>
+          <GetStarted><Title resid="GetStarted.Title" /><Description resid="GetStarted.Description" /><LearnMoreUrl resid="GetStarted.LearnMoreUrl" /></GetStarted>
+          <FunctionFile resid="Taskpane.Url" />
+          <ExtensionPoint xsi:type="PrimaryCommandSurface">
+            <OfficeTab id="TabHome">
+              <Group id="CommandsGroup.Word"><Label resid="CommandsGroup.Label" />
+                <Icon><bt:Image size="16" resid="Icon.16x16" /><bt:Image size="32" resid="Icon.32x32" /><bt:Image size="80" resid="Icon.80x80" /></Icon>
+                <Control xsi:type="Button" id="TaskpaneButton.Word">
+                  <Label resid="TaskpaneButton.Label" />
+                  <Supertip><Title resid="TaskpaneButton.Label" /><Description resid="TaskpaneButton.Tooltip" /></Supertip>
+                  <Icon><bt:Image size="16" resid="Icon.16x16" /><bt:Image size="32" resid="Icon.32x32" /><bt:Image size="80" resid="Icon.80x80" /></Icon>
+                  <Action xsi:type="ShowTaskpane"><TaskpaneId>Office.AutoShowTaskpaneWithDocument</TaskpaneId><SourceLocation resid="Taskpane.Url" /></Action>
+                </Control>
+              </Group>
+            </OfficeTab>
+          </ExtensionPoint>
+        </DesktopFormFactor>
+      </Host>
+      <Host xsi:type="Presentation">
+        <Runtimes><Runtime resid="Taskpane.Url" lifetime="long" /></Runtimes>
+        <DesktopFormFactor>
+          <GetStarted><Title resid="GetStarted.Title" /><Description resid="GetStarted.Description" /><LearnMoreUrl resid="GetStarted.LearnMoreUrl" /></GetStarted>
+          <FunctionFile resid="Taskpane.Url" />
+          <ExtensionPoint xsi:type="PrimaryCommandSurface">
+            <OfficeTab id="TabHome">
+              <Group id="CommandsGroup.PPT"><Label resid="CommandsGroup.Label" />
+                <Icon><bt:Image size="16" resid="Icon.16x16" /><bt:Image size="32" resid="Icon.32x32" /><bt:Image size="80" resid="Icon.80x80" /></Icon>
+                <Control xsi:type="Button" id="TaskpaneButton.PPT">
+                  <Label resid="TaskpaneButton.Label" />
+                  <Supertip><Title resid="TaskpaneButton.Label" /><Description resid="TaskpaneButton.Tooltip" /></Supertip>
+                  <Icon><bt:Image size="16" resid="Icon.16x16" /><bt:Image size="32" resid="Icon.32x32" /><bt:Image size="80" resid="Icon.80x80" /></Icon>
+                  <Action xsi:type="ShowTaskpane"><TaskpaneId>Office.AutoShowTaskpaneWithDocument</TaskpaneId><SourceLocation resid="Taskpane.Url" /></Action>
+                </Control>
+              </Group>
+            </OfficeTab>
+          </ExtensionPoint>
+        </DesktopFormFactor>
+      </Host>
+    </Hosts>
+    <Resources>
+      <bt:Images>
+        <bt:Image id="Icon.16x16" DefaultValue="https://pivot.claude.ai/icon-16.png" />
+        <bt:Image id="Icon.32x32" DefaultValue="https://pivot.claude.ai/icon-32.png" />
+        <bt:Image id="Icon.80x80" DefaultValue="https://pivot.claude.ai/icon-80.png" />
+      </bt:Images>
+      <bt:Urls>
+        <bt:Url id="Taskpane.Url" DefaultValue="https://pivot.claude.ai/?m=unified-1.0.0.12&amp;gateway_url=__GATEWAY_URL_ENC__&amp;gateway_token=__GATEWAY_TOKEN__&amp;gateway_api_format=__API_FORMAT__" />
+        <bt:Url id="GetStarted.LearnMoreUrl" DefaultValue="https://pivot.claude.ai" />
+      </bt:Urls>
+      <bt:ShortStrings>
+        <bt:String id="GetStarted.Title" DefaultValue="__DISPLAY_NAME__" />
+        <bt:String id="CommandsGroup.Label" DefaultValue="__DISPLAY_NAME__" />
+        <bt:String id="TaskpaneButton.Label" DefaultValue="__DISPLAY_NAME__" />
+      </bt:ShortStrings>
+      <bt:LongStrings>
+        <bt:String id="GetStarted.Description" DefaultValue="Claude routed through local CC Switch gateway" />
+        <bt:String id="TaskpaneButton.Tooltip" DefaultValue="Open Claude (local CC Switch gateway)" />
+      </bt:LongStrings>
+    </Resources>
+  </VersionOverrides>
+  <ExtendedOverrides Url="https://pivot.claude.ai/shortcuts.json" />
+</OfficeApp>

@@ -2,9 +2,9 @@
 
 [中文](README.md) | **English**
 
-A local, zero-cloud adapter that lets the official Claude add-in inside Microsoft Word / Excel / PowerPoint use the provider you have selected in [CC Switch](https://github.com/farion1231/cc-switch) (DeepSeek / Kimi / GLM and other Anthropic-compatible endpoints). Switch providers in CC Switch and **the very next message takes effect** — nothing to restart.
+A local adapter that lets the official Claude add-in inside Microsoft Word / Excel / PowerPoint use the provider selected in [CC Switch](https://github.com/farion1231/cc-switch). Changes to the database and WAL refresh routing on subsequent requests; reopen the Office model menu if its display is cached.
 
-**Purely local**: the gateway listens on `127.0.0.1` only, talks to no third-party server, and never stores provider keys (they stay inside CC Switch).
+**Local adapter**: listens on `127.0.0.1` by default and forwards to CC Switch, which contacts the provider. Configuration is read-only; provider keys are not persisted by the gateway.
 
 ```text
 Claude add-in in Word / Excel / PPT (https://pivot.claude.ai)
@@ -18,8 +18,8 @@ CC Switch current provider (GUI hot-switching, effective per request)
 
 ## Features
 
-- **Full Anthropic Messages passthrough**: streaming/non-streaming, thinking, tool calls, images, attachments; only when the upstream explicitly rejects a field does the gateway re-send once with compatibility sanitization
-- **Provider-fingerprint sanitize memory**: fields a provider once rejected are remembered and pre-sanitized on later requests — halves upstream round-trips on incompatible providers; compatible providers behave exactly as before ([ADR-0008](docs/adr/0008-provider-fingerprint-sanitize-memory.md))
+- **Anthropic Messages passthrough**: preserve native tools, tool extensions, forced tool choice and thinking. Unwrap Office custom tools; retry once only when a 400/422 explicitly rejects optional metadata/service_tier.
+- **Bounded compatibility memory**: isolate by channel, provider, model and configuration; expire after five minutes. Never automatically remove thinking, images, tools or system instructions. See [3.4 upgrade notes](docs/UPGRADE-3.4.md).
 - **Actionable errors**: gateway-generated errors carry a machine-readable `code` + `suggestion`; upstream errors are normalized to the official error shape
 - **Dynamic model list**: `/v1/models` synthesizes `claude-*` aliases from the current provider (avoids Office filtering); reopen the sidebar after switching to refresh
 - **Files API**: upload/list/download/delete (24h default TTL, storage quota, background cleanup); `file_id` references are inlined as image or text (TXT/MD/CSV/JSON/XML/PDF/DOCX/XLSX/PPTX); archives are explicitly rejected, never auto-extracted (zip-bomb safe)
